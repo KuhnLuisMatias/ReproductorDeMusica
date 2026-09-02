@@ -1,0 +1,10 @@
+<resources>
+    <!-- Single black fullscreen theme with splash support for TapPlay. -->
+    <style name="Theme.TapPlay" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@drawable/splash_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowSplashScreenBackground">@android:color/black</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/app_logo</item>
+    </style>
+</resources>
