@@ -36,6 +36,9 @@ sealed interface GestureAction {
 
     /** Signed number of 5% volume steps applied in real time (+ up / - down). */
     data class VolumeSteps(val steps: Int) : GestureAction
+
+    /** Finger lifted after a vertical volume drag; UI should fade out the volume overlay. */
+    data object VolumeDragEnd : GestureAction
 }
 
 /**
@@ -237,12 +240,16 @@ private suspend fun AwaitPointerEventScope.awaitTapOutcome(
     var lastSignedSteps = 0
     var isSwiping = false
     var longPressFired = false
+    var volumeDragActive = false
     while (true) {
         val event = awaitPointerEvent()
         val change = event.changes.firstOrNull { it.id == down.id } ?: return null
         if (!change.pressed) {
             if (change.isConsumed) return null
-            if (longPressFired || isSwiping) return null
+            if (longPressFired || isSwiping) {
+                if (volumeDragActive) onAction(GestureAction.VolumeDragEnd)
+                return null
+            }
             val dx = change.position.x - down.position.x
             val dy = change.position.y - down.position.y
             if (GestureHandler.isSwipe(density.pxToDp(hypot(dx, dy)))) {
@@ -273,6 +280,7 @@ private suspend fun AwaitPointerEventScope.awaitTapOutcome(
                 val signedSteps = GestureHandler.signedVolumeStepsFor(density.pxToDp(dy))
                 val delta = signedSteps - lastSignedSteps
                 if (delta != 0) {
+                    volumeDragActive = true
                     onAction(GestureAction.VolumeSteps(delta))
                     lastSignedSteps = signedSteps
                 }

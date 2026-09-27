@@ -270,4 +270,49 @@ class QueueSheetModelTest {
             assertEquals(0f, neighborShift(position = position, draggedAt = 2, target = 2, draggedHeight = 66f))
         }
     }
+
+    @Test
+    fun `artistSuggestionsFor with blank query returns nothing`() {
+        assertTrue(artistSuggestionsFor(listOf("Gonzalo", "Beta"), "").isEmpty())
+        assertTrue(artistSuggestionsFor(listOf("Gonzalo", "Beta"), "   ").isEmpty())
+    }
+
+    @Test
+    fun `artistSuggestionsFor matches case-insensitively and excludes exact match`() {
+        val artists = listOf("Gonzalo", "Gonzalo Jr", "Beta")
+
+        assertEquals(listOf("Gonzalo", "Gonzalo Jr"), artistSuggestionsFor(artists, "gonz"))
+        assertEquals(listOf("Gonzalo Jr"), artistSuggestionsFor(artists, "Gonzalo"))
+    }
+
+    @Test
+    fun `artistSuggestionsFor dedupes and respects the limit`() {
+        val artists = listOf("Gonzalo", "Gonzalo", "Gonzalo Jr", "Gonzalo III")
+
+        assertEquals(listOf("Gonzalo Jr"), artistSuggestionsFor(artists, "gonzalo j"))
+        assertEquals(2, artistSuggestionsFor(artists, "gonzalo", limit = 2).size)
+    }
+
+    @Test
+    fun `scrollbarDragToIndex clamps to the reachable scroll range`() {
+        assertEquals(0, scrollbarDragToIndex(dragY = -100f, totalItems = 50, visibleItems = 5, viewportPx = 1000f, minThumbPx = 32f))
+        // 45 = totalItems - visibleItems: the last index that still shows a full page (D0.9 scrollbarThumb convention).
+        assertEquals(
+            45,
+            scrollbarDragToIndex(dragY = 10_000f, totalItems = 50, visibleItems = 5, viewportPx = 1000f, minThumbPx = 32f),
+        )
+    }
+
+    @Test
+    fun `scrollbarDragToIndex maps the middle of the track to the middle of the list`() {
+        val index =
+            scrollbarDragToIndex(dragY = 500f, totalItems = 101, visibleItems = 1, viewportPx = 1000f, minThumbPx = 32f)
+
+        assertEquals(50, index)
+    }
+
+    @Test
+    fun `scrollbarDragToIndex with nothing to scroll returns the first item`() {
+        assertEquals(0, scrollbarDragToIndex(dragY = 500f, totalItems = 5, visibleItems = 5, viewportPx = 1000f, minThumbPx = 32f))
+    }
 }

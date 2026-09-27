@@ -47,6 +47,7 @@ import com.tapplay.ui.components.PlayPauseTransientOverlay
 import com.tapplay.ui.components.QueueSheetBackground
 import com.tapplay.ui.components.QueueSheetContent
 import com.tapplay.ui.components.SongInfo
+import com.tapplay.ui.components.VolumeIndicatorOverlay
 import com.tapplay.ui.components.queueRows
 import com.tapplay.util.GestureAction
 import com.tapplay.util.GestureHandler
@@ -70,6 +71,7 @@ fun PlayerScreen() {
             (context.applicationContext as TapPlayApplication).playbackManager
         }
     val state by playbackManager.uiState.collectAsStateWithLifecycle()
+    val volumePercent by playbackManager.volumePercent.collectAsStateWithLifecycle()
     val song = state.currentSong
     val scope = rememberCoroutineScope()
     val folderPickerFlow =
@@ -89,6 +91,7 @@ fun PlayerScreen() {
     }
 
     var tapTriggerCount by remember { mutableStateOf(0L) }
+    var isAdjustingVolume by remember { mutableStateOf(false) }
 
     val accent = Color(DEFAULT_ACCENT)
 
@@ -114,6 +117,7 @@ fun PlayerScreen() {
                 accent = accent,
                 sortMode = state.queueSortMode,
                 descending = state.queueSortDescending,
+                isVisible = sheetState.isVisible,
                 onSortSelected = { mode ->
                     scope.launch { playbackManager.reorderQueue(mode, state.queueSortDescending) }
                 },
@@ -154,6 +158,7 @@ fun PlayerScreen() {
                                         tapTriggerCount++
                                     }
                                 },
+                                onVolumeDragChanged = { isAdjustingVolume = it },
                             )
                         },
                         bottomExclusionPx = edgeExclusionPx,
@@ -240,6 +245,13 @@ fun PlayerScreen() {
                         .align(Alignment.BottomCenter)
                         .padding(start = 32.dp, end = 32.dp, bottom = 48.dp),
             )
+
+            // Full-screen volume wash while dragging; fades out once the finger lifts.
+            // Drawn last so it sits above the rest of the player visually.
+            VolumeIndicatorOverlay(
+                volumePercent = volumePercent,
+                isDragging = isAdjustingVolume,
+            )
         }
     }
 }
@@ -281,6 +293,7 @@ private fun handleGesture(
     playbackManager: PlaybackManager,
     state: PlayerUiState,
     onCenterTap: () -> Unit,
+    onVolumeDragChanged: (Boolean) -> Unit,
 ) {
     when (action) {
         is GestureAction.Tap ->
@@ -302,8 +315,11 @@ private fun handleGesture(
                 SwipeDirection.RIGHT -> playbackManager.previous()
                 SwipeDirection.UP, SwipeDirection.DOWN -> Unit
             }
-        is GestureAction.VolumeSteps ->
+        is GestureAction.VolumeSteps -> {
+            onVolumeDragChanged(true)
             playbackManager.changeVolumeBySteps(action.steps)
+        }
+        is GestureAction.VolumeDragEnd -> onVolumeDragChanged(false)
     }
 }
 

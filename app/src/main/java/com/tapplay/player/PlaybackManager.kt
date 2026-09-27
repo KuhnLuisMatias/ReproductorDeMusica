@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 class PlaybackManager(
     private val context: Context,
@@ -61,6 +62,14 @@ class PlaybackManager(
             ),
         )
     val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
+
+    private val audioManager get() = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    // Separate from PlayerUiState (same rationale as filter state above): the volume
+    // overlay is the only consumer and updates on every gesture step, so it stays
+    // out of the copy-heavy UI state to avoid unrelated recompositions.
+    private val _volumePercent = MutableStateFlow(volumePercentFor(currentStreamVolume()))
+    val volumePercent: StateFlow<Int> = _volumePercent.asStateFlow()
 
     private val playerListener =
         object : Player.Listener {
@@ -274,12 +283,11 @@ class PlaybackManager(
 
     fun changeVolumeBySteps(steps: Int) {
         if (steps == 0) return
-        val audioManager =
-            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val direction = if (steps > 0) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
         repeat(kotlin.math.abs(steps)) {
             audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, 0)
         }
+        _volumePercent.value = volumePercentFor(currentStreamVolume())
         scheduleVolumePersist()
     }
 
@@ -436,9 +444,8 @@ class PlaybackManager(
     }
 
     private fun setStreamVolume(level: Int) {
-        val audioManager =
-            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)
+        _volumePercent.value = volumePercentFor(level)
     }
 
     private fun scheduleVolumePersist() {
@@ -482,10 +489,11 @@ class PlaybackManager(
         prefs.positionMs = controller?.currentPosition ?: _uiState.value.positionMs
     }
 
-    private fun currentStreamVolume(): Int {
-        val audioManager =
-            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        return audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+    private fun currentStreamVolume(): Int = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+
+    private fun volumePercentFor(level: Int): Int {
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        return if (max == 0) 0 else ((level * 100f) / max).roundToInt().coerceIn(0, 100)
     }
 
     private fun updateTicker(isPlaying: Boolean) {

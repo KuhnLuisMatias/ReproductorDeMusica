@@ -3,7 +3,7 @@ package com.tapplay.ui.components
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -16,15 +16,19 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Fill
-import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
+
+/** Icon spans this fraction of the screen's shorter side — big enough to read at a glance. */
+private const val ICON_SCREEN_FRACTION = 0.5f
+private const val ICON_INNER_FRACTION = 0.875f // matches the previous 56dp / 64dp ratio
 
 /**
  * Modern, semi-transparent Play or Pause icon with transient fade-out animation.
  *
  * Requirements:
  * - Shows ONLY Play OR Pause, NEVER both together.
- * - Appears centered when triggered, stays briefly, and smoothly fades out to 0 alpha.
+ * - Appears centered when triggered at a large, screen-relative size, stays
+ *   briefly, and smoothly fades out to 0 alpha.
  * - Ultra-clean iOS aesthetic.
  */
 @Composable
@@ -44,15 +48,16 @@ fun PlayPauseTransientOverlay(
         }
     }
 
-    if (alphaAnim.value > 0.01f) {
-        Box(
-            modifier = modifier.size(64.dp),
-            contentAlignment = Alignment.Center,
-        ) {
+    BoxWithConstraints(
+        modifier = modifier,
+        contentAlignment = Alignment.Center,
+    ) {
+        if (alphaAnim.value > 0.01f) {
             val currentAlpha = alphaAnim.value
             val iconColor = Color.White.copy(alpha = currentAlpha)
+            val iconSize = minOf(maxWidth, maxHeight) * ICON_SCREEN_FRACTION
 
-            Canvas(modifier = Modifier.size(56.dp)) {
+            Canvas(modifier = Modifier.size(iconSize * ICON_INNER_FRACTION)) {
                 val w = size.width
                 val h = size.height
 
