@@ -8,6 +8,8 @@ import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +33,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -92,6 +95,12 @@ fun PlayerScreen() {
 
     var tapTriggerCount by remember { mutableStateOf(0L) }
     var isAdjustingVolume by remember { mutableStateOf(false) }
+
+    val songInfoBlur by animateDpAsState(
+        targetValue = if (isAdjustingVolume) 16.dp else 0.dp,
+        animationSpec = tween(durationMillis = 200),
+        label = "songInfoBlur",
+    )
 
     val accent = Color(DEFAULT_ACCENT)
 
@@ -213,14 +222,17 @@ fun PlayerScreen() {
                 }
             }
 
-            // Typography: Centered in the upper-middle area
+            // Typography: Centered in the upper-middle area (blurs during volume drag)
             Column(
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 32.dp)
                         .align(Alignment.Center)
-                        .padding(bottom = 120.dp),
+                        .padding(bottom = 120.dp)
+                        .then(
+                            if (songInfoBlur > 0.dp) Modifier.blur(songInfoBlur) else Modifier
+                        ),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 SongInfo(
@@ -236,10 +248,11 @@ fun PlayerScreen() {
                 modifier = Modifier.align(Alignment.Center),
             )
 
-            // Bottom Minimal Progress Bar
+            // Bottom Segmented Vertical Block Progress Bar
             MinimalProgressBar(
                 positionMs = state.positionMs,
                 durationMs = state.durationMs,
+                onSeek = { targetMs -> playbackManager.seekTo(targetMs) },
                 modifier =
                     Modifier
                         .align(Alignment.BottomCenter)
