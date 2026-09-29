@@ -55,15 +55,16 @@ class QueueManager {
 
 /**
  * Whether [this] song matches the queue-sheet search [query]: case-
- * insensitive `contains` on title OR artist (the only fields a row renders).
- * Blank query matches everything (total fn). Single source of truth for
- * matching — QueueSheet.filterRows delegates to it (R14): what the sheet
- * shows == what playback plays.
+ * insensitive `contains` on title, artist OR album. Blank query matches
+ * everything (total fn). Single source of truth for matching —
+ * QueueSheet.filterRows delegates to it (R14): what the sheet shows == what
+ * playback plays.
  */
 fun Song.matchesQuery(query: String): Boolean =
     query.isBlank() ||
         title.contains(query, ignoreCase = true) ||
-        artist.contains(query, ignoreCase = true)
+        artist.contains(query, ignoreCase = true) ||
+        album.contains(query, ignoreCase = true)
 
 /**
  * Index of the song whose path equals [path]; 0 as the safe fallback for

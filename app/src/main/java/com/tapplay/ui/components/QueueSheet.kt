@@ -4,6 +4,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -27,6 +28,8 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.DropdownMenu
 import androidx.compose.material.DropdownMenuItem
 import androidx.compose.material.Icon
@@ -49,6 +52,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -59,11 +63,13 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -83,7 +89,7 @@ private val ScrollbarColor = Color.White.copy(alpha = 0.35f)
 private val ScrollbarWidth = 4.dp
 private val ScrollbarEndPadding = 6.dp
 private val ScrollbarMinThumbHeight = 32.dp
-private val ScrollbarHitWidth = 32.dp
+private val ScrollbarHitWidth = 16.dp
 private val ScrubPreviewHeight = 32.dp
 private const val ARTIST_SUGGESTION_LIMIT = 6
 
@@ -119,10 +125,10 @@ fun queueRows(
 
 /**
  * Pure visual filter (JVM-tested): blank query → all rows; otherwise
- * case-insensitive `contains` on title OR artist (the only fields a row
- * renders). Rows keep their REAL queue index — tap-to-jump stays correct on
- * a filtered list. D contract: while [query] is non-blank, drag-reorder is
- * disabled (filtered positions ≠ queue indices).
+ * case-insensitive `contains` on title, artist OR album. Rows keep their
+ * REAL queue index — tap-to-jump stays correct on a filtered list. D
+ * contract: while [query] is non-blank, drag-reorder is disabled (filtered
+ * positions ≠ queue indices).
  * Matching delegates to Song.matchesQuery (R14): what the sheet shows == what playback plays.
  */
 fun filterRows(
@@ -185,6 +191,27 @@ fun neighborShift(
     }
 
 /**
+ * Pure viewport→list resolution (JVM-tested): [targetViewportIndex] is a
+ * position within the visible-items subset (from `targetPosition`, viewport
+ * order), which only coincides with an index into [rows] when the list is
+ * scrolled to the very top. Any scroll offset makes the two index spaces
+ * diverge; this looks up the song uri at that viewport slot in [visibleKeys]
+ * and resolves it back to its real position in [rows]. Falls back to
+ * [fallback] when the viewport index or its uri can't be resolved (e.g. the
+ * dragged row scrolled out of the visible range).
+ */
+fun resolveDropTarget(
+    rows: List<QueueRow>,
+    visibleKeys: List<String>,
+    targetViewportIndex: Int,
+    fallback: Int,
+): Int {
+    val key = visibleKeys.getOrNull(targetViewportIndex) ?: return fallback
+    val index = rows.indexOfFirst { it.song.uri == key }
+    return if (index >= 0) index else fallback
+}
+
+/**
  * Pure geometry for the queue scrollbar thumb (JVM-tested): returns
  * (offsetY, heightPx) or null when the list fits without scrolling.
  * Thumb height reflects how much of the list is visible (list length
@@ -207,6 +234,40 @@ fun scrollbarThumb(
     val scrollableItems = (totalItems - visibleItems).toFloat()
     val fraction = ((firstIndex + itemFraction) / scrollableItems).coerceIn(0f, 1f)
     return Pair(fraction * (viewportPx - thumbHeight), thumbHeight)
+}
+
+/**
+ * Pure scroll-anchor lookup (JVM-tested, design C2): index of the row whose
+ * song uri equals [uri], or null when [uri] is null or not present (e.g. the
+ * saved anchor was dropped from the queue) — callers fall back to the
+ * current-track jump in that case.
+ */
+fun anchorIndex(
+    rows: List<QueueRow>,
+    uri: String?,
+): Int? {
+    if (uri == null) return null
+    val index = rows.indexOfFirst { it.song.uri == uri }
+    return index.takeIf { it >= 0 }
+}
+
+private const val RECENT_SEARCHES_CAP = 5
+
+/**
+ * Pure recent-searches update (JVM-tested, design C3): trims [query],
+ * ignores it if blank, moves a case-insensitive duplicate to the front
+ * instead of adding a second entry, and caps the result at [cap] (oldest
+ * entries dropped first).
+ */
+fun pushRecentSearch(
+    recent: List<String>,
+    query: String,
+    cap: Int = RECENT_SEARCHES_CAP,
+): List<String> {
+    val trimmed = query.trim()
+    if (trimmed.isBlank()) return recent
+    val withoutDuplicate = recent.filterNot { it.equals(trimmed, ignoreCase = true) }
+    return (listOf(trimmed) + withoutDuplicate).take(cap)
 }
 
 /**
@@ -292,12 +353,19 @@ fun QueueSheetContent(
     sortMode: SortMode,
     descending: Boolean,
     isVisible: Boolean,
+    isPlaying: Boolean,
     onSortSelected: (SortMode) -> Unit,
     onToggleDirection: () -> Unit,
     onRowTap: (Int) -> Unit,
     onMoveRow: (from: Int, to: Int) -> Unit,
     onQueryChanged: (String) -> Unit,
     onPickFolder: () -> Unit,
+    onTogglePlayPause: () -> Unit,
+    scrollAnchorUri: String? = null,
+    onScrollAnchorChanged: (String) -> Unit = {},
+    recentSearches: List<String> = emptyList(),
+    onCommitSearch: (String) -> Unit = {},
+    onSearchYoutube: (String) -> Unit = {},
 ) {
     if (rows.isEmpty()) {
         Text(
@@ -327,12 +395,34 @@ fun QueueSheetContent(
     val allArtists = remember(rows) { rows.map { it.song.artist }.distinct() }
     val artistSuggestions = remember(query, allArtists) { artistSuggestionsFor(allArtists, query) }
 
-    // Jump to the currently playing track whenever the sheet is opened, so
-    // scrolling around and reopening it never loses your place.
+    // Restore the saved scroll anchor whenever the sheet is opened with a blank
+    // query (design C2); the current-track jump is only the fallback when no
+    // anchor was saved yet (or it fell out of the queue).
+    var anchorRestored by remember { mutableStateOf(false) }
     LaunchedEffect(isVisible) {
+        anchorRestored = false
         if (!isVisible) return@LaunchedEffect
-        val currentRow = visibleRows.indexOfFirst { it.isCurrent }
-        if (currentRow >= 0) listState.scrollToItem(currentRow)
+        val targetRow =
+            if (query.isBlank()) {
+                anchorIndex(visibleRows, scrollAnchorUri) ?: visibleRows.indexOfFirst { it.isCurrent }
+            } else {
+                visibleRows.indexOfFirst { it.isCurrent }
+            }
+        if (targetRow >= 0) listState.scrollToItem(targetRow)
+        anchorRestored = true
+    }
+
+    // Persists the first visible row's uri as the new scroll anchor, but only
+    // once the restore above has run — otherwise the initial index-0 render
+    // would overwrite a real saved anchor before it's even applied.
+    LaunchedEffect(isVisible, anchorRestored) {
+        if (!isVisible || !anchorRestored) return@LaunchedEffect
+        snapshotFlow { listState.firstVisibleItemIndex }
+            .collect { index ->
+                if (query.isBlank()) {
+                    visibleRows.getOrNull(index)?.song?.uri?.let(onScrollAnchorChanged)
+                }
+            }
     }
 
     fun locateCurrent() {
@@ -360,25 +450,46 @@ fun QueueSheetContent(
         val draggedAt = visibleRows.indexOfFirst { it.song.uri == draggingUri }
         val info = listState.layoutInfo.visibleItemsInfo
         val draggedAtInfo = info.indexOfFirst { it.key == draggingUri }
-        val target =
+        val targetViewportIndex =
             if (draggedAt >= 0 && draggedAtInfo >= 0) {
                 targetPosition(draggedAtInfo, dragOffsetY, info.map { it.offset + it.size / 2f })
             } else {
-                draggedAt
+                draggedAtInfo
             }
+        // targetViewportIndex is viewport-local (a position among visible items only);
+        // resolve it back to its real position in visibleRows before using it as one.
+        val target =
+            resolveDropTarget(
+                rows = visibleRows,
+                visibleKeys = info.mapNotNull { it.key as? String },
+                targetViewportIndex = targetViewportIndex,
+                fallback = draggedAt,
+            )
         val from = visibleRows.getOrNull(draggedAt)?.index
         val to = visibleRows.getOrNull(target.coerceIn(visibleRows.indices))?.index
         draggingUri = null
         dragOffsetY = 0f
         if (from != null && to != null && from != to) onMoveRow(from, to)
     }
-    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp / 2).dp
+    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp).dp
     Column(
         modifier =
             Modifier
                 .fillMaxWidth()
                 .background(QueueSheetBackground),
     ) {
+        // Grabber: signals "this is a sheet" at a glance, independent of the
+        // system status-bar/notch look.
+        Box(
+            modifier =
+                Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .padding(top = 10.dp)
+                    .width(36.dp)
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(Color.White.copy(alpha = 0.9f)),
+        )
         SortHeader(
             sortMode = sortMode,
             descending = descending,
@@ -410,6 +521,11 @@ fun QueueSheetContent(
                     singleLine = true,
                     textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 15.sp),
                     cursorBrush = SolidColor(Color.White),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions =
+                        KeyboardActions(onSearch = {
+                            if (query.isNotBlank()) onCommitSearch(query)
+                        }),
                     modifier = Modifier.weight(1f),
                     decorationBox = { innerTextField ->
                         Box {
@@ -426,6 +542,8 @@ fun QueueSheetContent(
                 )
                 IconButton(
                     onClick = {
+                        // C3: closing with a non-blank query commits it to recents.
+                        if (query.isNotBlank()) onCommitSearch(query)
                         query = ""
                         onQueryChanged("")
                         searchVisible = false
@@ -457,6 +575,33 @@ fun QueueSheetContent(
                                     .clickable {
                                         query = artist
                                         onQueryChanged(artist)
+                                        onCommitSearch(artist)
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+            } else if (query.isBlank() && recentSearches.isNotEmpty()) {
+                // Recents shown only when the search field is open with nothing typed yet.
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(recentSearches) { recent ->
+                        Text(
+                            text = recent,
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier =
+                                Modifier
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color.White.copy(alpha = 0.1f))
+                                    .clickable {
+                                        query = recent
+                                        onQueryChanged(recent)
+                                        onCommitSearch(recent)
                                     }
                                     .padding(horizontal = 12.dp, vertical = 6.dp),
                         )
@@ -474,21 +619,40 @@ fun QueueSheetContent(
                 modifier =
                     Modifier
                         .fillMaxSize()
+                        .zIndex(if (draggingUri != null) 2f else 0f)
                         .queueScrollbar(listState, ScrollbarColor),
                 state = listState,
             ) {
                 if (visibleRows.isEmpty()) {
                     item {
-                        Text(
-                            text = "Sin resultados",
-                            color = Color.White.copy(alpha = 0.6f),
-                            fontSize = 14.sp,
-                            textAlign = TextAlign.Center,
+                        Column(
                             modifier =
                                 Modifier
                                     .fillMaxWidth()
                                     .padding(vertical = 24.dp),
-                        )
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                text = "Sin resultados",
+                                color = Color.White.copy(alpha = 0.6f),
+                                fontSize = 14.sp,
+                                textAlign = TextAlign.Center,
+                            )
+                            if (query.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = "Buscar \"$query\" en YouTube",
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    modifier =
+                                        Modifier
+                                            .clip(RoundedCornerShape(16.dp))
+                                            .background(Color.White.copy(alpha = 0.12f))
+                                            .clickable { onSearchYoutube(query) }
+                                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                                )
+                            }
+                        }
                     }
                 }
                 itemsIndexed(visibleRows, key = { _, row -> row.song.uri }) { index, row ->
@@ -505,15 +669,9 @@ fun QueueSheetContent(
                         row = row,
                         accent = accent,
                         onRowTap = onRowTap,
-                        showDragHandle = query.isBlank(),
-                        onDragHandleStart = {
-                            if (draggingUri == null) {
-                                draggingUri = row.song.uri
-                                dragOffsetY = 0f
-                            }
-                        },
-                        onDragHandleDelta = { dragOffsetY += it },
-                        onDragHandleEnd = { dropDragged() },
+                        isDragging = row.song.uri == draggingUri,
+                        isPlaying = isPlaying,
+                        onTogglePlayPause = onTogglePlayPause,
                         modifier =
                             Modifier
                                 .zIndex(if (row.song.uri == draggingUri) 1f else 0f)
@@ -545,7 +703,25 @@ fun QueueSheetContent(
                                             }
                                         }
                                 }
-                                .animateItemPlacement(),
+                                .animateItemPlacement()
+                                .pointerInput(row.song.uri) {
+                                    // Reorder from anywhere on the row (no dedicated handle): a
+                                    // long-press distinguishes "drag to reorder" from a plain tap.
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = {
+                                            if (query.isNotBlank()) return@detectDragGesturesAfterLongPress
+                                            if (draggingUri != null) return@detectDragGesturesAfterLongPress
+                                            draggingUri = row.song.uri
+                                            dragOffsetY = 0f
+                                        },
+                                        onDrag = { change, dragAmount ->
+                                            dragOffsetY += dragAmount.y
+                                            change.consume()
+                                        },
+                                        onDragEnd = { dropDragged() },
+                                        onDragCancel = { dropDragged() },
+                                    )
+                                },
                     )
                 }
             }
@@ -559,28 +735,35 @@ fun QueueSheetContent(
                         .align(Alignment.CenterEnd)
                         .fillMaxHeight()
                         .width(ScrollbarHitWidth)
-                        .pointerInput(visibleRows.size) {
-                            fun updateScrub(y: Float) {
-                                val visibleItems = listState.layoutInfo.visibleItemsInfo.size
-                                scrubIndex =
-                                    scrollbarDragToIndex(
-                                        dragY = y,
-                                        totalItems = visibleRows.size,
-                                        visibleItems = visibleItems,
-                                        viewportPx = size.height.toFloat(),
-                                        minThumbPx = ScrollbarMinThumbHeight.toPx(),
+                        .zIndex(1f)
+                        .then(
+                            if (draggingUri == null) {
+                                Modifier.pointerInput(visibleRows.size) {
+                                    fun updateScrub(y: Float) {
+                                        val visibleItems = listState.layoutInfo.visibleItemsInfo.size
+                                        scrubIndex =
+                                            scrollbarDragToIndex(
+                                                dragY = y,
+                                                totalItems = visibleRows.size,
+                                                visibleItems = visibleItems,
+                                                viewportPx = size.height.toFloat(),
+                                                minThumbPx = ScrollbarMinThumbHeight.toPx(),
+                                            )
+                                    }
+                                    detectDragGestures(
+                                        onDragStart = { offset -> updateScrub(offset.y) },
+                                        onDrag = { change, _ ->
+                                            updateScrub(change.position.y)
+                                            change.consume()
+                                        },
+                                        onDragEnd = { scrubIndex = null },
+                                        onDragCancel = { scrubIndex = null },
                                     )
-                            }
-                            detectDragGestures(
-                                onDragStart = { offset -> updateScrub(offset.y) },
-                                onDrag = { change, _ ->
-                                    updateScrub(change.position.y)
-                                    change.consume()
-                                },
-                                onDragEnd = { scrubIndex = null },
-                                onDragCancel = { scrubIndex = null },
-                            )
-                        },
+                                }
+                            } else {
+                                Modifier
+                            },
+                        ),
             )
 
             // Floating label previewing the artist you'd land on, following the
@@ -599,6 +782,7 @@ fun QueueSheetContent(
                     modifier =
                         Modifier
                             .align(Alignment.TopEnd)
+                            .zIndex(3f)
                             .padding(end = 40.dp)
                             .offset(y = previewY)
                             .clip(RoundedCornerShape(8.dp))
@@ -608,12 +792,14 @@ fun QueueSheetContent(
             }
 
             // Contextual chip: only takes header space when it's actually useful,
-            // i.e. you've scrolled the currently playing track out of view.
-            if (currentRowOffscreen) {
+            // i.e. you've scrolled the currently playing track out of view. Hidden
+            // while dragging so it never competes with the drag handle for attention.
+            if (currentRowOffscreen && draggingUri == null) {
                 Row(
                     modifier =
                         Modifier
                             .align(Alignment.BottomCenter)
+                            .zIndex(3f)
                             .padding(bottom = 12.dp)
                             .clip(RoundedCornerShape(16.dp))
                             .background(Color.White.copy(alpha = 0.12f))
@@ -766,23 +952,30 @@ private fun SortMode.label(): String =
         SortMode.DATE_ADDED -> "Fecha de agregado"
     }
 
+private val DraggedRowBackground = Color(0xFF2A2A2A)
+
 @Composable
 private fun QueueRowItem(
     modifier: Modifier = Modifier,
     row: QueueRow,
     accent: Color,
     onRowTap: (Int) -> Unit,
-    showDragHandle: Boolean,
-    onDragHandleStart: () -> Unit,
-    onDragHandleDelta: (Float) -> Unit,
-    onDragHandleEnd: () -> Unit,
+    isDragging: Boolean,
+    isPlaying: Boolean,
+    onTogglePlayPause: () -> Unit,
 ) {
     val highlight = accent.copy(alpha = 0.25f)
+    val rowBackground =
+        when {
+            isDragging -> DraggedRowBackground
+            row.isCurrent -> highlight
+            else -> Color.Transparent
+        }
     Row(
         modifier =
             modifier
                 .fillMaxWidth()
-                .background(if (row.isCurrent) highlight else Color.Transparent)
+                .background(rowBackground)
                 .clickable { onRowTap(row.index) }
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -806,60 +999,57 @@ private fun QueueRowItem(
             )
         }
         Spacer(modifier = Modifier.width(12.dp))
-        Text(
-            text = row.durationText,
-            color = Color.White.copy(alpha = 0.6f),
-            fontSize = 12.sp,
-        )
-        if (showDragHandle) {
-            Spacer(modifier = Modifier.width(8.dp))
-            DragHandle(
-                onDragStart = onDragHandleStart,
-                onDragDelta = onDragHandleDelta,
-                onDragEnd = onDragHandleEnd,
+        if (row.isCurrent) {
+            Box(
+                modifier =
+                    Modifier
+                        .size(28.dp)
+                        .clickable { onTogglePlayPause() },
+                contentAlignment = Alignment.Center,
+            ) {
+                PlayPauseGlyph(
+                    isPlaying = isPlaying,
+                    tint = accent,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        } else {
+            Text(
+                text = row.durationText,
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 12.sp,
             )
         }
     }
 }
 
-/**
- * Explicit drag grip: reordering starts the instant you press and move here —
- * no long-press wait — while the rest of the row stays a plain tap-to-jump
- * target. The enclosing itemsIndexed `key` already recreates this composable
- * per song uri, so `pointerInput(Unit)` is enough to rebind per row.
- */
+/** Small play/pause glyph for the current-track row (mirrors PlayPauseTransientOverlay's shapes). */
 @Composable
-private fun DragHandle(
-    onDragStart: () -> Unit,
-    onDragDelta: (Float) -> Unit,
-    onDragEnd: () -> Unit,
+private fun PlayPauseGlyph(
+    isPlaying: Boolean,
+    tint: Color,
+    modifier: Modifier = Modifier,
 ) {
-    Canvas(
-        modifier =
-            Modifier
-                .size(width = 20.dp, height = 24.dp)
-                .pointerInput(Unit) {
-                    detectDragGestures(
-                        onDragStart = { onDragStart() },
-                        onDrag = { change, dragAmount ->
-                            onDragDelta(dragAmount.y)
-                            change.consume()
-                        },
-                        onDragEnd = onDragEnd,
-                        onDragCancel = onDragEnd,
-                    )
-                },
-    ) {
-        val lineSpacing = size.height / 4f
-        val strokeWidth = size.height * 0.09f
-        for (i in 1..3) {
-            val y = lineSpacing * i
-            drawLine(
-                color = Color.White.copy(alpha = 0.35f),
-                start = Offset(0f, y),
-                end = Offset(size.width, y),
-                strokeWidth = strokeWidth,
-            )
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        if (isPlaying) {
+            val barWidth = w * 0.28f
+            val gap = w * 0.16f
+            val leftX = (w - gap) / 2f - barWidth
+            val rightX = (w + gap) / 2f
+            val cornerRadius = CornerRadius(barWidth / 3f, barWidth / 3f)
+            drawRoundRect(color = tint, topLeft = Offset(leftX, 0f), size = Size(barWidth, h), cornerRadius = cornerRadius)
+            drawRoundRect(color = tint, topLeft = Offset(rightX, 0f), size = Size(barWidth, h), cornerRadius = cornerRadius)
+        } else {
+            val path =
+                Path().apply {
+                    moveTo(w * 0.2f, 0f)
+                    lineTo(w * 0.85f, h / 2f)
+                    lineTo(w * 0.2f, h)
+                    close()
+                }
+            drawPath(path = path, color = tint)
         }
     }
 }

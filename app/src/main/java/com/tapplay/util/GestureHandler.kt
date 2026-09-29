@@ -58,17 +58,18 @@ object GestureHandler {
     const val LONG_PRESS_SLOP_DP = 12f
 
     /**
-     * Bottom-band start floor (dp): a queue-sheet edge swipe must begin below
-     * `screenHeight - max(systemGestureInset, this)` so it never fights Android
-     * gesture navigation.
+     * Bottom-band start floor (dp): volume drags starting below
+     * `screenHeight - max(systemGestureInset, this)` are suppressed so they
+     * never fight Android gesture navigation.
      */
-    const val EDGE_EXCLUSION_DP = 48f
+    const val BOTTOM_EDGE_EXCLUSION_DP = 48f
 
     /**
-     * Max elapsed time (down -> lift) for a bottom-edge swipe to count as a
-     * quick flick; slower drags are ignored.
+     * Top-band start floor (dp), symmetric to [BOTTOM_EDGE_EXCLUSION_DP]:
+     * volume drags starting above `max(systemGestureInset, this)` are
+     * suppressed so they never fight the notification shade gesture.
      */
-    const val QUICK_SWIPE_WINDOW_MS = 600L
+    const val TOP_EDGE_EXCLUSION_DP = 48f
 
     fun resolveZone(
         x: Float,
@@ -118,24 +119,24 @@ object GestureHandler {
         exclusionPx: Float,
     ): Boolean = startYpx > heightPx - exclusionPx
 
-    /** True when a gesture starting at [downYpx] must not emit volume steps (bottom edge band). */
+    /** True when a pointer down at [startYpx] lands in the top-edge trigger band. */
+    fun isInTopEdgeZone(
+        startYpx: Float,
+        exclusionPx: Float,
+    ): Boolean = startYpx < exclusionPx
+
+    /**
+     * True when a gesture starting at [downYpx] must not emit volume steps —
+     * either the bottom edge band or the top edge band.
+     */
     fun isVolumeDragSuppressed(
         downYpx: Float,
         heightPx: Float,
+        topExclusionPx: Float,
         bottomExclusionPx: Float,
-    ): Boolean = isInBottomEdgeZone(downYpx, heightPx, bottomExclusionPx)
-
-    /**
-     * True when a completed gesture is an upward, vertical-dominant swipe whose
-     * whole duration (down -> lift) fits inside [QUICK_SWIPE_WINDOW_MS]. Measured
-     * at lift rather than at threshold crossing so a slow drag (which already
-     * crosses 50dp early) never triggers.
-     */
-    fun isQuickUpwardSwipe(
-        dx: Float,
-        dy: Float,
-        elapsedMs: Long,
-    ): Boolean = dy < 0f && abs(dy) > abs(dx) && elapsedMs <= QUICK_SWIPE_WINDOW_MS
+    ): Boolean =
+        isInTopEdgeZone(downYpx, topExclusionPx) ||
+            isInBottomEdgeZone(downYpx, heightPx, bottomExclusionPx)
 }
 
 /**
@@ -144,16 +145,20 @@ object GestureHandler {
  * vertical swipes apply volume steps in real time during the drag and
  * track the finger both ways, so reversing mid-gesture is immediate.
  *
- * Gestures starting in the bottom [bottomExclusionPx] band suppress volume
- * emission (the sheet-open edge detector owns that band); gestures whose
- * first down was consumed by a child (icon clickables) are ignored entirely.
+ * Gestures starting in the top [topExclusionPx] band or the bottom
+ * [bottomExclusionPx] band suppress volume emission (the top band protects
+ * the notification shade gesture, the bottom band protects gesture
+ * navigation); gestures whose first down was consumed by a child (icon
+ * clickables) are ignored entirely.
  */
 fun Modifier.tapPlayGestures(
     onAction: (GestureAction) -> Unit,
+    topExclusionPx: Float = 0f,
     bottomExclusionPx: Float = 0f,
 ): Modifier =
     composed {
         val currentOnAction by rememberUpdatedState(onAction)
+        val currentTopExclusionPx by rememberUpdatedState(topExclusionPx)
         val currentBottomExclusionPx by rememberUpdatedState(bottomExclusionPx)
         pointerInput(Unit) {
             val swipeThresholdPx = GestureHandler.SWIPE_THRESHOLD_DP.dp.toPx()
@@ -169,6 +174,7 @@ fun Modifier.tapPlayGestures(
                     volumeStepPx = volumeStepPx,
                     longPressSlopPx = longPressSlopPx,
                     longPressTimeoutMs = longPressTimeoutMs,
+                    topExclusionPx = currentTopExclusionPx,
                     bottomExclusionPx = currentBottomExclusionPx,
                 ) { currentOnAction(it) }
             }
@@ -182,6 +188,7 @@ private suspend fun AwaitPointerEventScope.handleGestureCycle(
     volumeStepPx: Float,
     longPressSlopPx: Float,
     longPressTimeoutMs: Long,
+    topExclusionPx: Float,
     bottomExclusionPx: Float,
     onAction: (GestureAction) -> Unit,
 ) {
@@ -191,6 +198,7 @@ private suspend fun AwaitPointerEventScope.handleGestureCycle(
         GestureHandler.isVolumeDragSuppressed(
             downYpx = down.position.y,
             heightPx = size.height.toFloat(),
+            topExclusionPx = topExclusionPx,
             bottomExclusionPx = bottomExclusionPx,
         )
     while (true) {
@@ -258,6 +266,13 @@ private suspend fun AwaitPointerEventScope.awaitTapOutcome(
             }
             return GestureHandler.resolveZone(down.position.x, size.width.toFloat())
         }
+        if (change.isConsumed && !isSwiping) {
+            // A1b: a sibling (e.g. SongInfo's passiveLongPress) started consuming
+            // this pointer mid-press — abort so a drag afterward never emits a
+            // swipe or volume step on top of it.
+            if (volumeDragActive) onAction(GestureAction.VolumeDragEnd)
+            return null
+        }
         val dx = change.position.x - down.position.x
         val dy = change.position.y - down.position.y
         val distancePx = hypot(dx, dy)
@@ -301,48 +316,51 @@ private suspend fun AwaitPointerEventScope.awaitPointerUp(pointerId: PointerId) 
 private fun Density.pxToDp(px: Float): Float = px.toDp().value
 
 /**
- * Bottom-edge shortcut: a quick upward flick starting in the screen's bottom
- * band (below [GestureHandler.EDGE_EXCLUSION_DP] or the system gesture inset,
- * whichever is larger) invokes [onOpen]. Slow drags and starts above the band
- * are ignored, so cover gestures and system navigation stay
- * untouched. No visual feedback is produced.
+ * Observes a press without consuming the initial down (A1): while
+ * [enabled], waits up to the platform long-press timeout for the pointer to
+ * lift or drift beyond [GestureHandler.LONG_PRESS_SLOP_DP]. If neither
+ * happens before the timeout, it fires [onLongPress] (the caller applies
+ * haptics) and starts consuming every subsequent change for that pointer so
+ * a drag afterward cannot also trigger a sibling's tap/swipe/volume drag —
+ * see the sibling-side abort in `awaitTapOutcome` (A1b).
  *
- * Set [enabled] to false while the target sheet is already visible to avoid
- * re-triggering.
+ * Because the down is never consumed up front, tap-to-play, double-tap,
+ * swipes and volume drags starting on the same node keep working right up
+ * until the long-press threshold actually fires.
  */
-fun Modifier.bottomEdgeSwipeToOpen(
-    exclusionPx: Float,
-    enabled: Boolean,
-    onOpen: () -> Unit,
+fun Modifier.passiveLongPress(
+    enabled: Boolean = true,
+    onLongPress: () -> Unit,
 ): Modifier =
     composed {
-        val currentOnOpen by rememberUpdatedState(onOpen)
         val currentEnabled by rememberUpdatedState(enabled)
-        val currentExclusionPx by rememberUpdatedState(exclusionPx)
+        val currentOnLongPress by rememberUpdatedState(onLongPress)
         pointerInput(Unit) {
-            val swipeThresholdPx = GestureHandler.SWIPE_THRESHOLD_DP.dp.toPx()
+            val longPressSlopPx = GestureHandler.LONG_PRESS_SLOP_DP.dp.toPx()
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
-                if (!currentEnabled ||
-                    !GestureHandler.isInBottomEdgeZone(down.position.y, size.height.toFloat(), currentExclusionPx)
-                ) {
-                    return@awaitEachGesture
-                }
-                val downTime = down.uptimeMillis
-                while (true) {
-                    val event = awaitPointerEvent()
-                    val change = event.changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
-                    if (!change.pressed) {
-                        val dx = change.position.x - down.position.x
-                        val dy = change.position.y - down.position.y
-                        val elapsed = change.uptimeMillis - downTime
-                        if (abs(dy) > swipeThresholdPx &&
-                            GestureHandler.isQuickUpwardSwipe(dx, dy, elapsed)
-                        ) {
-                            change.consume()
-                            currentOnOpen()
+                if (!currentEnabled || down.isConsumed) return@awaitEachGesture
+                val longPressTimeoutMs = ViewConfiguration.getLongPressTimeout().toLong()
+                val firedNaturally =
+                    withTimeoutOrNull(longPressTimeoutMs) {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: return@withTimeoutOrNull false
+                            if (!change.pressed) return@withTimeoutOrNull false
+                            val dx = change.position.x - down.position.x
+                            val dy = change.position.y - down.position.y
+                            if (hypot(dx, dy) > longPressSlopPx) return@withTimeoutOrNull false
                         }
-                        return@awaitEachGesture
+                        @Suppress("UNREACHABLE_CODE")
+                        false
+                    }
+                if (firedNaturally == null) {
+                    currentOnLongPress()
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
+                        if (!change.pressed) return@awaitEachGesture
+                        change.consume()
                     }
                 }
             }

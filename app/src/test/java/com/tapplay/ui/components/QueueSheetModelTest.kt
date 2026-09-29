@@ -12,12 +12,13 @@ class QueueSheetModelTest {
         title: String,
         durationMs: Long,
         artist: String = "artist",
+        album: String = "album",
     ) = Song(
         uri = "content://tree/$title",
         path = "content://tree/$title",
         title = title,
         artist = artist,
-        album = "album",
+        album = album,
         durationMs = durationMs,
         artBytes = null,
     )
@@ -79,6 +80,19 @@ class QueueSheetModelTest {
         val rows = queueRows(listOf(song("a", 0L, artist = "Gonzalo"), song("b", 0L)), currentIndex = 0)
 
         val filtered = filterRows(rows, "gonz")
+
+        assertEquals(listOf("a"), filtered.map { it.song.title })
+    }
+
+    @Test
+    fun `filterRows matches album`() {
+        val rows =
+            queueRows(
+                listOf(song("a", 0L, album = "Abbey Road"), song("b", 0L, album = "Other")),
+                currentIndex = 0,
+            )
+
+        val filtered = filterRows(rows, "abbey")
 
         assertEquals(listOf("a"), filtered.map { it.song.title })
     }
@@ -314,5 +328,132 @@ class QueueSheetModelTest {
     @Test
     fun `scrollbarDragToIndex with nothing to scroll returns the first item`() {
         assertEquals(0, scrollbarDragToIndex(dragY = 500f, totalItems = 5, visibleItems = 5, viewportPx = 1000f, minThumbPx = 32f))
+    }
+
+    // ---- backdropEffect: API31+ blur+dim, API30 dim-only fallback (B2) ----
+
+    @Test
+    fun `api 31 and above blurs and dims proportionally to amount`() {
+        val effect = backdropEffect(sdkInt = 31, amount = 1f)
+
+        assertEquals(12f, effect.blurDp)
+        assertEquals(0.25f, effect.dimAlpha)
+    }
+
+    @Test
+    fun `api 31 and above scales down with a partial amount`() {
+        val effect = backdropEffect(sdkInt = 33, amount = 0.5f)
+
+        assertEquals(6f, effect.blurDp)
+        assertEquals(0.125f, effect.dimAlpha)
+    }
+
+    @Test
+    fun `api 30 falls back to dim only with zero blur`() {
+        val effect = backdropEffect(sdkInt = 30, amount = 1f)
+
+        assertEquals(0f, effect.blurDp)
+        assertEquals(0.55f, effect.dimAlpha)
+    }
+
+    @Test
+    fun `api 30 dim scales down with a partial amount`() {
+        val effect = backdropEffect(sdkInt = 28, amount = 0.5f)
+
+        assertEquals(0f, effect.blurDp)
+        assertEquals(0.275f, effect.dimAlpha)
+    }
+
+    @Test
+    fun `zero amount produces no visible effect on either api tier`() {
+        assertEquals(BackdropEffect(0f, 0f), backdropEffect(sdkInt = 31, amount = 0f))
+        assertEquals(BackdropEffect(0f, 0f), backdropEffect(sdkInt = 30, amount = 0f))
+    }
+
+    // ---- anchorIndex: pure scroll-anchor lookup by song uri (C2) ----
+
+    @Test
+    fun `anchorIndex finds the row whose uri matches`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L), song("c", 0L)), currentIndex = 0)
+
+        assertEquals(1, anchorIndex(rows, "content://tree/b"))
+    }
+
+    @Test
+    fun `anchorIndex returns null for an unknown or null uri`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 0)
+
+        assertNull(anchorIndex(rows, "content://tree/unknown"))
+        assertNull(anchorIndex(rows, null))
+    }
+
+    // ---- pushRecentSearch: capped, deduped, newest-first (C3) ----
+
+    @Test
+    fun `pushRecentSearch adds a new query to the front`() {
+        val result = pushRecentSearch(listOf("beatles"), "abbey road")
+
+        assertEquals(listOf("abbey road", "beatles"), result)
+    }
+
+    @Test
+    fun `pushRecentSearch moves an existing case-insensitive duplicate to the front`() {
+        val result = pushRecentSearch(listOf("Beatles", "queen"), "beatles")
+
+        assertEquals(listOf("beatles", "queen"), result)
+    }
+
+    @Test
+    fun `pushRecentSearch ignores blank queries`() {
+        val result = pushRecentSearch(listOf("beatles"), "   ")
+
+        assertEquals(listOf("beatles"), result)
+    }
+
+    @Test
+    fun `pushRecentSearch trims whitespace and caps at 5 by default`() {
+        val result = pushRecentSearch(listOf("a", "b", "c", "d", "e"), "  f  ")
+
+        assertEquals(listOf("f", "a", "b", "c", "d"), result)
+    }
+
+    @Test
+    fun `pushRecentSearch respects a custom cap`() {
+        val result = pushRecentSearch(listOf("a", "b"), "c", cap = 2)
+
+        assertEquals(listOf("c", "a"), result)
+    }
+
+    @Test
+    fun `resolveDropTarget maps a viewport-local index back to the row's real position`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L), song("c", 0L), song("d", 0L), song("e", 0L)), currentIndex = 0)
+        // Scrolled past "a": the viewport only shows b, c, d, in that order.
+        val visibleKeys = listOf(rows[1].song.uri, rows[2].song.uri, rows[3].song.uri)
+
+        // Viewport-local index 2 is "d", whose real position in the full list is 3 —
+        // a naive `visibleRows[2]` would have wrongly landed on "c" (real position 2).
+        val target = resolveDropTarget(rows, visibleKeys, targetViewportIndex = 2, fallback = 99)
+
+        assertEquals(3, target)
+    }
+
+    @Test
+    fun `resolveDropTarget falls back when the viewport index is out of range`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 0)
+        val visibleKeys = listOf(rows[0].song.uri, rows[1].song.uri)
+
+        val target = resolveDropTarget(rows, visibleKeys, targetViewportIndex = 5, fallback = 1)
+
+        assertEquals(1, target)
+    }
+
+    @Test
+    fun `resolveDropTarget falls back when the resolved key is not in rows`() {
+        val rows = queueRows(listOf(song("a", 0L)), currentIndex = 0)
+        val visibleKeys = listOf("content://tree/unknown")
+
+        val target = resolveDropTarget(rows, visibleKeys, targetViewportIndex = 0, fallback = 0)
+
+        assertEquals(0, target)
     }
 }

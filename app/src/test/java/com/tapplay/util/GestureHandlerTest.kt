@@ -171,57 +171,50 @@ class GestureHandlerTest {
         assertFalse(GestureHandler.isInBottomEdgeZone(1501f, 1600f, 99f))
     }
 
-    // ---- Volume suppression band: same geometry as the edge band ----
-
-    @Test
-    fun `down inside the bottom band suppresses volume drag`() {
-        // 1600px screen, 99px exclusion (48dp at 2.0625 density) -> band starts at 1501
-        assertTrue(GestureHandler.isVolumeDragSuppressed(1560f, 1600f, 99f))
-        assertTrue(GestureHandler.isVolumeDragSuppressed(1599f, 1600f, 99f))
-    }
-
-    @Test
-    fun `down above the bottom band keeps volume drags live`() {
-        assertFalse(GestureHandler.isVolumeDragSuppressed(1500f, 1600f, 99f))
-        assertFalse(GestureHandler.isVolumeDragSuppressed(0f, 1600f, 99f))
-    }
-
-    @Test
-    fun `down exactly at the band boundary is not suppressed`() {
-        assertFalse(GestureHandler.isVolumeDragSuppressed(1501f, 1600f, 99f))
-    }
-
-    // ---- Quick upward swipe: vertical dominant, up, whole gesture within window ----
-
-    @Test
-    fun `fast upward vertical dominant swipe qualifies as quick`() {
-        assertTrue(GestureHandler.isQuickUpwardSwipe(dx = 10f, dy = -300f, elapsedMs = 150L))
-        assertTrue(GestureHandler.isQuickUpwardSwipe(dx = 0f, dy = -51f, elapsedMs = 600L))
-    }
-
-    @Test
-    fun `swipe completed after the 600ms window is too slow`() {
-        assertFalse(GestureHandler.isQuickUpwardSwipe(dx = 0f, dy = -300f, elapsedMs = 601L))
-        assertFalse(GestureHandler.isQuickUpwardSwipe(dx = 0f, dy = -680f, elapsedMs = 2500L))
-    }
-
-    @Test
-    fun `downward movement never qualifies as an upward quick swipe`() {
-        assertFalse(GestureHandler.isQuickUpwardSwipe(dx = 0f, dy = 300f, elapsedMs = 100L))
-    }
-
-    @Test
-    fun `horizontal dominant movement never qualifies as an upward quick swipe`() {
-        assertFalse(GestureHandler.isQuickUpwardSwipe(dx = 300f, dy = -100f, elapsedMs = 100L))
-    }
-
-    @Test
-    fun `quick swipe window is 600ms`() {
-        assertEquals(600L, GestureHandler.QUICK_SWIPE_WINDOW_MS)
-    }
+    // ---- Bottom edge exclusion: renamed constant (A2) ----
 
     @Test
     fun `bottom edge exclusion floor is 48dp`() {
-        assertEquals(48f, GestureHandler.EDGE_EXCLUSION_DP)
+        assertEquals(48f, GestureHandler.BOTTOM_EDGE_EXCLUSION_DP)
+    }
+
+    // ---- Top edge zone: symmetric to the bottom band (A2) ----
+
+    @Test
+    fun `top edge exclusion floor is 48dp`() {
+        assertEquals(48f, GestureHandler.TOP_EDGE_EXCLUSION_DP)
+    }
+
+    @Test
+    fun `start inside the top exclusion band is a top edge start`() {
+        assertTrue(GestureHandler.isInTopEdgeZone(0f, 99f))
+        assertTrue(GestureHandler.isInTopEdgeZone(98f, 99f))
+    }
+
+    @Test
+    fun `start at or beyond the top exclusion band is not a top edge start`() {
+        assertFalse(GestureHandler.isInTopEdgeZone(99f, 99f))
+        assertFalse(GestureHandler.isInTopEdgeZone(500f, 99f))
+    }
+
+    // ---- Volume suppression band: now checks both top and bottom (A2) ----
+
+    @Test
+    fun `down inside the bottom band suppresses volume drag with both exclusions`() {
+        assertTrue(GestureHandler.isVolumeDragSuppressed(1560f, 1600f, 99f, 99f))
+        assertTrue(GestureHandler.isVolumeDragSuppressed(1599f, 1600f, 99f, 99f))
+    }
+
+    @Test
+    fun `down inside the top band suppresses volume drag with both exclusions`() {
+        assertTrue(GestureHandler.isVolumeDragSuppressed(0f, 1600f, 99f, 99f))
+        assertTrue(GestureHandler.isVolumeDragSuppressed(98f, 1600f, 99f, 99f))
+    }
+
+    @Test
+    fun `down between both bands keeps volume drags live`() {
+        assertFalse(GestureHandler.isVolumeDragSuppressed(800f, 1600f, 99f, 99f))
+        assertFalse(GestureHandler.isVolumeDragSuppressed(99f, 1600f, 99f, 99f))
+        assertFalse(GestureHandler.isVolumeDragSuppressed(1501f, 1600f, 99f, 99f))
     }
 }

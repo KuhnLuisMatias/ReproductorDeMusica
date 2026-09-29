@@ -2,6 +2,7 @@ package com.tapplay.ui
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -9,6 +10,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -51,12 +53,15 @@ import com.tapplay.ui.components.QueueSheetBackground
 import com.tapplay.ui.components.QueueSheetContent
 import com.tapplay.ui.components.SongInfo
 import com.tapplay.ui.components.VolumeIndicatorOverlay
+import com.tapplay.ui.components.backdropEffect
+import com.tapplay.ui.components.pushRecentSearch
+import com.tapplay.ui.components.queueBackdrop
 import com.tapplay.ui.components.queueRows
 import com.tapplay.util.GestureAction
 import com.tapplay.util.GestureHandler
 import com.tapplay.util.GestureZone
 import com.tapplay.util.SwipeDirection
-import com.tapplay.util.bottomEdgeSwipeToOpen
+import com.tapplay.util.passiveLongPress
 import com.tapplay.util.tapPlayGestures
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -73,6 +78,9 @@ fun PlayerScreen() {
         remember {
             (context.applicationContext as TapPlayApplication).playbackManager
         }
+    val prefs = remember { (context.applicationContext as TapPlayApplication).prefs }
+    var scrollAnchorUri by remember { mutableStateOf(prefs.queueScrollAnchorUri) }
+    var recentSearches by remember { mutableStateOf(prefs.recentSearches) }
     val state by playbackManager.uiState.collectAsStateWithLifecycle()
     val volumePercent by playbackManager.volumePercent.collectAsStateWithLifecycle()
     val song = state.currentSong
@@ -104,16 +112,37 @@ fun PlayerScreen() {
 
     val accent = Color(DEFAULT_ACCENT)
 
-    val sheetState = rememberModalBottomSheetState(ModalBottomSheetValue.Hidden)
+    // skipHalfExpanded: the sheet is capped at 100% of screen height (see maxSheetHeight
+    // in QueueSheetContent), which is tall enough that M2 would otherwise offer a
+    // HalfExpanded stop on the way up — show() should jump straight to full height.
+    val sheetState =
+        rememberModalBottomSheetState(
+            initialValue = ModalBottomSheetValue.Hidden,
+            skipHalfExpanded = true,
+        )
     BackHandler(enabled = sheetState.isVisible) {
         scope.launch { sheetState.hide() }
     }
 
+    // B2: backdrop amount tracks the sheet's target (not just isVisible) so the
+    // blur/dim animates in step with the sheet's own open/close motion.
+    val backdropAmount by animateFloatAsState(
+        targetValue = if (sheetState.targetValue != ModalBottomSheetValue.Hidden) 1f else 0f,
+        animationSpec = tween(durationMillis = 250),
+        label = "queueBackdropAmount",
+    )
+    val backdrop = backdropEffect(sdkInt = Build.VERSION.SDK_INT, amount = backdropAmount)
+
     val density = LocalDensity.current
-    val edgeExclusionPx =
+    val bottomExclusionPx =
         max(
             WindowInsets.systemGestures.getBottom(density).toFloat(),
-            with(density) { GestureHandler.EDGE_EXCLUSION_DP.dp.toPx() },
+            with(density) { GestureHandler.BOTTOM_EDGE_EXCLUSION_DP.dp.toPx() },
+        )
+    val topExclusionPx =
+        max(
+            WindowInsets.systemGestures.getTop(density).toFloat(),
+            with(density) { GestureHandler.TOP_EDGE_EXCLUSION_DP.dp.toPx() },
         )
 
     ModalBottomSheetLayout(
@@ -127,6 +156,7 @@ fun PlayerScreen() {
                 sortMode = state.queueSortMode,
                 descending = state.queueSortDescending,
                 isVisible = sheetState.isVisible,
+                isPlaying = state.isPlaying,
                 onSortSelected = { mode ->
                     scope.launch { playbackManager.reorderQueue(mode, state.queueSortDescending) }
                 },
@@ -140,6 +170,19 @@ fun PlayerScreen() {
                     scope.launch { sheetState.hide() }
                     folderPickerFlow.onFolderIconTapped()
                 },
+                onTogglePlayPause = { playbackManager.togglePlayPause() },
+                scrollAnchorUri = scrollAnchorUri,
+                onScrollAnchorChanged = { uri ->
+                    scrollAnchorUri = uri
+                    prefs.queueScrollAnchorUri = uri
+                },
+                recentSearches = recentSearches,
+                onCommitSearch = { queryText ->
+                    val updated = pushRecentSearch(recentSearches, queryText)
+                    recentSearches = updated
+                    prefs.recentSearches = updated
+                },
+                onSearchYoutube = { query -> openYoutubeSearch(context, query) },
             )
         },
     ) {
@@ -148,11 +191,7 @@ fun PlayerScreen() {
                 Modifier
                     .fillMaxSize()
                     .background(Color.Black)
-                    .bottomEdgeSwipeToOpen(
-                        exclusionPx = edgeExclusionPx,
-                        enabled = !sheetState.isVisible,
-                        onOpen = { scope.launch { sheetState.show() } },
-                    )
+                    .queueBackdrop(backdrop)
                     .tapPlayGestures(
                         onAction = { action ->
                             handleGesture(
@@ -170,7 +209,8 @@ fun PlayerScreen() {
                                 onVolumeDragChanged = { isAdjustingVolume = it },
                             )
                         },
-                        bottomExclusionPx = edgeExclusionPx,
+                        topExclusionPx = topExclusionPx,
+                        bottomExclusionPx = bottomExclusionPx,
                     ),
         ) {
             // Traversal phase: no folder counts yet — indeterminate feedback (spec T1)
@@ -238,6 +278,11 @@ fun PlayerScreen() {
                 SongInfo(
                     title = song?.title ?: if (state.queue.isEmpty()) "Toca para abrir carpeta" else "Sin título",
                     artist = song?.artist ?: if (state.queue.isEmpty()) "TapPlay" else "Desconocido",
+                    modifier =
+                        Modifier.passiveLongPress(
+                            enabled = !sheetState.isVisible,
+                            onLongPress = { scope.launch { sheetState.show() } },
+                        ),
                 )
             }
 
@@ -286,6 +331,22 @@ private fun handleFolderPicked(
     }
 }
 
+/**
+ * Lightweight "search elsewhere" fallback for a queue search with no local
+ * matches: hands off to the YouTube app (or a browser, if it's not
+ * installed) via an ACTION_VIEW intent. No WebView, no INTERNET permission —
+ * the network request happens in the target app/browser, not this process,
+ * which keeps TapPlay's offline-only footprint unchanged.
+ */
+private fun openYoutubeSearch(
+    context: Context,
+    query: String,
+) {
+    val url = "https://www.youtube.com/results?search_query=" + Uri.encode(query)
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+    context.startActivity(intent)
+}
+
 private suspend fun requestPostNotificationsIfNeeded(
     context: Context,
     request: () -> Unit,
@@ -321,7 +382,7 @@ private fun handleGesture(
                 GestureZone.LEFT -> playbackManager.previous()
                 GestureZone.RIGHT -> playbackManager.next()
             }
-        is GestureAction.LongPress -> playbackManager.seekTo(0L)
+        is GestureAction.LongPress -> Unit
         is GestureAction.HorizontalSwipe ->
             when (action.direction) {
                 SwipeDirection.LEFT -> playbackManager.next()

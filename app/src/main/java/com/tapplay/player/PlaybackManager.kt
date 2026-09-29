@@ -148,7 +148,13 @@ class PlaybackManager(
     }
 
     fun togglePlayPause() {
-        controller?.let { if (it.isPlaying) it.pause() else it.play() }
+        val mediaController = controller ?: return
+        val willPlay = !mediaController.isPlaying
+        if (willPlay) mediaController.play() else mediaController.pause()
+        // Optimistic: onIsPlayingChanged confirms this later, but callers (e.g. the
+        // play/pause transient overlay) read uiState synchronously right after this
+        // call — without this, they'd render the PRE-toggle icon for one frame.
+        _uiState.update { it.copy(isPlaying = willPlay) }
     }
 
     fun seekTo(positionMs: Long) {
@@ -171,6 +177,7 @@ class PlaybackManager(
         val mediaController = controller ?: return
         if (activeQuery.isBlank()) {
             mediaController.seekTo(index, 0L)
+            mediaController.play() // tapping a row starts playback, even if paused
             updateState()
             return
         }
@@ -178,13 +185,16 @@ class PlaybackManager(
         val subset = base.filter { it.matchesQuery(activeQuery) }
         if (queueManager.currentQueue == subset) {
             mediaController.seekTo(index, 0L) // synced: index already subset-relative
+            mediaController.play()
             updateState()
             return
         }
         val tapped = queueManager.currentQueue.getOrNull(index) ?: return
         val target = indexOfSong(subset, tapped.path) // visible row ⇒ found; ?: 0 guard
         if (fullQueue == null) fullQueue = base
-        swapTimeline(subset, target, 0L) // tapped track starts at 0; play/pause untouched
+        swapTimeline(subset, target, 0L) // tapped track starts at 0; swapTimeline calls updateState()
+        mediaController.play()
+        updateState() // re-sync isPlaying: swapTimeline's updateState() ran before play() above
     }
 
     fun next() {

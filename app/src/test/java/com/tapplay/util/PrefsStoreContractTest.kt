@@ -67,6 +67,22 @@ class PrefsStoreContractTest {
             set(value) {
                 strings[SharedPreferencesStore.KEY_QUEUE_SNAPSHOT] = value
             }
+
+        override var queueScrollAnchorUri: String?
+            get() = strings[SharedPreferencesStore.KEY_QUEUE_SCROLL_ANCHOR_URI]
+            set(value) {
+                strings[SharedPreferencesStore.KEY_QUEUE_SCROLL_ANCHOR_URI] = value
+            }
+
+        override var recentSearches: List<String>
+            get() =
+                strings[SharedPreferencesStore.KEY_RECENT_SEARCHES]
+                    ?.split("\n")
+                    ?.filter { it.isNotBlank() }
+                    ?: emptyList()
+            set(value) {
+                strings[SharedPreferencesStore.KEY_RECENT_SEARCHES] = value.joinToString("\n")
+            }
     }
 
     private lateinit var prefs: PrefsStore
@@ -87,6 +103,8 @@ class PrefsStoreContractTest {
         assertEquals("queue_sort_mode", SharedPreferencesStore.KEY_QUEUE_SORT_MODE)
         assertEquals("queue_sort_descending", SharedPreferencesStore.KEY_QUEUE_SORT_DESCENDING)
         assertEquals("queue_snapshot", SharedPreferencesStore.KEY_QUEUE_SNAPSHOT)
+        assertEquals("queue_scroll_anchor_uri", SharedPreferencesStore.KEY_QUEUE_SCROLL_ANCHOR_URI)
+        assertEquals("recent_searches", SharedPreferencesStore.KEY_RECENT_SEARCHES)
     }
 
     @Test
@@ -99,6 +117,8 @@ class PrefsStoreContractTest {
         assertEquals("ADDED", prefs.queueSortMode)
         assertTrue(prefs.queueSortDescending)
         assertNull(prefs.queueSnapshot)
+        assertNull(prefs.queueScrollAnchorUri)
+        assertEquals(emptyList<String>(), prefs.recentSearches)
     }
 
     @Test
@@ -160,5 +180,36 @@ class PrefsStoreContractTest {
         assertFalse(prefs.queueSortDescending)
         prefs.queueSortDescending = true
         assertTrue(prefs.queueSortDescending)
+    }
+
+    @Test
+    fun `queue scroll anchor uri round trips and clears to null`() {
+        prefs.queueScrollAnchorUri = "content://tree/song-b"
+        assertEquals("content://tree/song-b", prefs.queueScrollAnchorUri)
+
+        prefs.queueScrollAnchorUri = null
+        assertNull(prefs.queueScrollAnchorUri)
+    }
+
+    @Test
+    fun `recent searches round trip as an ordered list`() {
+        prefs.recentSearches = listOf("abbey road", "beatles", "queen")
+
+        assertEquals(listOf("abbey road", "beatles", "queen"), prefs.recentSearches)
+    }
+
+    @Test
+    fun `recent searches overwritten with a shorter list drops the rest`() {
+        prefs.recentSearches = listOf("a", "b", "c")
+        prefs.recentSearches = listOf("z")
+
+        assertEquals(listOf("z"), prefs.recentSearches)
+    }
+
+    @Test
+    fun `recent searches empty list round trips as empty`() {
+        prefs.recentSearches = emptyList()
+
+        assertEquals(emptyList<String>(), prefs.recentSearches)
     }
 }

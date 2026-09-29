@@ -16,6 +16,12 @@ interface PrefsStore {
     var queueSortMode: String
     var queueSortDescending: Boolean
     var queueSnapshot: String?
+
+    /** Song uri to scroll the queue sheet back to on reopen (design C2), or null if none saved yet. */
+    var queueScrollAnchorUri: String?
+
+    /** Most recent search queries, newest first, capped at 5 (design C3). */
+    var recentSearches: List<String>
 }
 
 class SharedPreferencesStore(
@@ -53,6 +59,18 @@ class SharedPreferencesStore(
         get() = prefs.getString(KEY_QUEUE_SNAPSHOT, null)
         set(value) = prefs.edit().putString(KEY_QUEUE_SNAPSHOT, value).apply()
 
+    override var queueScrollAnchorUri: String?
+        get() = prefs.getString(KEY_QUEUE_SCROLL_ANCHOR_URI, null)
+        set(value) = prefs.edit().putString(KEY_QUEUE_SCROLL_ANCHOR_URI, value).apply()
+
+    override var recentSearches: List<String>
+        get() =
+            prefs.getString(KEY_RECENT_SEARCHES, null)
+                ?.split("\n")
+                ?.filter { it.isNotBlank() }
+                ?: emptyList()
+        set(value) = prefs.edit().putString(KEY_RECENT_SEARCHES, value.joinToString("\n")).apply()
+
     companion object {
         const val PREFS_NAME = "tapplay_prefs"
         const val KEY_LAST_FOLDER_URI = "last_folder_uri"
@@ -63,6 +81,8 @@ class SharedPreferencesStore(
         const val KEY_QUEUE_SORT_MODE = "queue_sort_mode"
         const val KEY_QUEUE_SORT_DESCENDING = "queue_sort_descending"
         const val KEY_QUEUE_SNAPSHOT = "queue_snapshot"
+        const val KEY_QUEUE_SCROLL_ANCHOR_URI = "queue_scroll_anchor_uri"
+        const val KEY_RECENT_SEARCHES = "recent_searches"
 
         fun from(context: Context): SharedPreferencesStore =
             SharedPreferencesStore(
