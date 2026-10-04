@@ -418,6 +418,19 @@ class PlaybackManager(
     }
 
     /**
+     * Removes an item at [index] from the media controller and queue manager.
+     */
+    fun removeFromQueue(index: Int) {
+        val mediaController = controller ?: return
+        val queue = queueManager.currentQueue
+        if (index !in queue.indices) return
+        mediaController.removeMediaItem(index)
+        queueManager.removeItem(index)
+        persistQueueSnapshot(queueManager.currentQueue)
+        updateState()
+    }
+
+    /**
      * Single scan path for both call sites (folder pick and cold-start
      * restore): reports per-song progress into the UI state. Cancellation
      * resets progress and rethrows; any other failure resets progress and

@@ -1,7 +1,8 @@
-﻿package com.tapplay.ui.components
+package com.tapplay.ui.components
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
@@ -16,10 +17,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
@@ -35,12 +38,18 @@ import androidx.compose.material.DropdownMenuItem
 import androidx.compose.material.Icon
 import androidx.compose.material.IconButton
 import androidx.compose.material.LocalTextStyle
-import androidx.compose.material.Text
 import androidx.compose.foundation.Canvas
+import androidx.compose.material.Text
+import androidx.compose.material.DismissDirection
+import androidx.compose.material.DismissValue
+import androidx.compose.material.ExperimentalMaterialApi
+import androidx.compose.material.SwipeToDismiss
+import androidx.compose.material.rememberDismissState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Search
@@ -86,11 +95,13 @@ import kotlin.math.roundToInt
 val QueueSheetBackground = Color.Black
 private val SeparatorColor = Color.White.copy(alpha = 0.08f)
 private val ScrollbarColor = Color.White.copy(alpha = 0.35f)
-private val ScrollbarWidth = 4.dp
+private val ScrollbarWidth = 8.dp
 private val ScrollbarEndPadding = 6.dp
 private val ScrollbarMinThumbHeight = 32.dp
-private val ScrollbarHitWidth = 16.dp
+private val ScrollbarHitWidth = 28.dp
 private val ScrubPreviewHeight = 32.dp
+private val HeaderButtonSize = 40.dp
+private val SortLabelMaxWidth = 130.dp
 private const val ARTIST_SUGGESTION_LIMIT = 6
 
 /** Immutable view model of one queue sheet row (pure, JVM-tested). */
@@ -345,7 +356,7 @@ fun Modifier.queueScrollbar(
  * The sheet is capped at half the screen height and shows a scrollbar thumb
  * that communicates scroll position and relative list length.
  */
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterialApi::class)
 @Composable
 fun QueueSheetContent(
     rows: List<QueueRow>,
@@ -358,9 +369,11 @@ fun QueueSheetContent(
     onToggleDirection: () -> Unit,
     onRowTap: (Int) -> Unit,
     onMoveRow: (from: Int, to: Int) -> Unit,
+    onRemoveRow: (Int) -> Unit = {},
     onQueryChanged: (String) -> Unit,
     onPickFolder: () -> Unit,
     onTogglePlayPause: () -> Unit,
+    onClose: () -> Unit = {},
     scrollAnchorUri: String? = null,
     onScrollAnchorChanged: (String) -> Unit = {},
     recentSearches: List<String> = emptyList(),
@@ -394,6 +407,7 @@ fun QueueSheetContent(
 
     val allArtists = remember(rows) { rows.map { it.song.artist }.distinct() }
     val artistSuggestions = remember(query, allArtists) { artistSuggestionsFor(allArtists, query) }
+    val currentArtist = remember(rows) { rows.firstOrNull { it.isCurrent }?.song?.artist }
 
     // Restore the saved scroll anchor whenever the sheet is opened with a blank
     // query (design C2); the current-track jump is only the fallback when no
@@ -476,20 +490,9 @@ fun QueueSheetContent(
         modifier =
             Modifier
                 .fillMaxWidth()
+                .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp, bottomStart = 28.dp, bottomEnd = 28.dp))
                 .background(QueueSheetBackground),
     ) {
-        // Grabber: signals "this is a sheet" at a glance, independent of the
-        // system status-bar/notch look.
-        Box(
-            modifier =
-                Modifier
-                    .align(Alignment.CenterHorizontally)
-                    .padding(top = 10.dp)
-                    .width(36.dp)
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(Color.White.copy(alpha = 0.9f)),
-        )
         SortHeader(
             sortMode = sortMode,
             descending = descending,
@@ -581,12 +584,35 @@ fun QueueSheetContent(
                         )
                     }
                 }
-            } else if (query.isBlank() && recentSearches.isNotEmpty()) {
-                // Recents shown only when the search field is open with nothing typed yet.
+            } else if (query.isBlank() && (currentArtist != null || recentSearches.isNotEmpty())) {
+                // Shown only when the search field is open with nothing typed yet: the
+                // artist currently playing (fastest way to filter to "what's on now"),
+                // then recent searches.
                 LazyRow(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
+                    if (currentArtist != null) {
+                        item {
+                            Text(
+                                text = "▸ $currentArtist",
+                                color = accent,
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier =
+                                    Modifier
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(accent.copy(alpha = 0.18f))
+                                        .clickable {
+                                            query = currentArtist
+                                            onQueryChanged(currentArtist)
+                                            onCommitSearch(currentArtist)
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                            )
+                        }
+                    }
                     items(recentSearches) { recent ->
                         Text(
                             text = recent,
@@ -609,10 +635,13 @@ fun QueueSheetContent(
                 }
             }
         }
+        // weight(fill = false): the footer below is measured first, so the list can never
+        // push it off the bottom of the screen; the list still wraps short content.
         BoxWithConstraints(
             modifier =
                 Modifier
                     .fillMaxWidth()
+                    .weight(1f, fill = false)
                     .heightIn(max = maxSheetHeight),
         ) {
             LazyColumn(
@@ -665,63 +694,108 @@ fun QueueSheetContent(
                                     .background(SeparatorColor),
                         )
                     }
-                    QueueRowItem(
-                        row = row,
-                        accent = accent,
-                        onRowTap = onRowTap,
-                        isDragging = row.song.uri == draggingUri,
-                        isPlaying = isPlaying,
-                        onTogglePlayPause = onTogglePlayPause,
-                        modifier =
-                            Modifier
-                                .zIndex(if (row.song.uri == draggingUri) 1f else 0f)
-                                .graphicsLayer {
-                                    translationY =
-                                        when {
-                                            row.song.uri == draggingUri -> dragOffsetY
-                                            draggingUri == null -> 0f
-                                            else -> {
-                                                val info = listState.layoutInfo.visibleItemsInfo
-                                                val draggedAt = info.indexOfFirst { it.key == draggingUri }
-                                                val meAt = info.indexOfFirst { it.key == row.song.uri }
-                                                if (draggedAt < 0 || meAt < 0) {
-                                                    0f
-                                                } else {
-                                                    val target =
-                                                        targetPosition(
-                                                            draggedAt,
-                                                            dragOffsetY,
-                                                            info.map { it.offset + it.size / 2f },
-                                                        )
-                                                    neighborShift(
-                                                        meAt,
-                                                        draggedAt,
-                                                        target,
-                                                        info[draggedAt].size.toFloat(),
-                                                    )
-                                                }
-                                            }
-                                        }
+                    val dismissState = rememberDismissState(
+                        confirmStateChange = { dismissValue ->
+                            if (dismissValue == DismissValue.DismissedToStart) {
+                                onRemoveRow(row.index)
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    )
+                    SwipeToDismiss(
+                        state = dismissState,
+                        directions = setOf(DismissDirection.EndToStart),
+                        background = {
+                            val isDismissing = dismissState.dismissDirection == DismissDirection.EndToStart
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(if (isDismissing) Color(0xFFE53935) else Color.Transparent)
+                                    .padding(horizontal = 20.dp),
+                                contentAlignment = Alignment.CenterEnd
+                            ) {
+                                if (isDismissing) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.End
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Delete,
+                                            contentDescription = "Remover",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "REMOVER",
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 14.sp
+                                        )
+                                    }
                                 }
-                                .animateItemPlacement()
-                                .pointerInput(row.song.uri) {
-                                    // Reorder from anywhere on the row (no dedicated handle): a
-                                    // long-press distinguishes "drag to reorder" from a plain tap.
-                                    detectDragGesturesAfterLongPress(
-                                        onDragStart = {
-                                            if (query.isNotBlank()) return@detectDragGesturesAfterLongPress
-                                            if (draggingUri != null) return@detectDragGesturesAfterLongPress
-                                            draggingUri = row.song.uri
-                                            dragOffsetY = 0f
+                            }
+                        },
+                        dismissContent = {
+                            QueueRowItem(
+                                row = row,
+                                accent = accent,
+                                onRowTap = onRowTap,
+                                isDragging = row.song.uri == draggingUri,
+                                isPlaying = isPlaying,
+                                onTogglePlayPause = onTogglePlayPause,
+                                modifier =
+                                    Modifier
+                                        .zIndex(if (row.song.uri == draggingUri) 1f else 0f)
+                                        .graphicsLayer {
+                                            translationY =
+                                                when {
+                                                    row.song.uri == draggingUri -> dragOffsetY
+                                                    draggingUri == null -> 0f
+                                                    else -> {
+                                                        val info = listState.layoutInfo.visibleItemsInfo
+                                                        val draggedAt = info.indexOfFirst { it.key == draggingUri }
+                                                        val meAt = info.indexOfFirst { it.key == row.song.uri }
+                                                        if (draggedAt < 0 || meAt < 0) {
+                                                            0f
+                                                        } else {
+                                                            val target =
+                                                                targetPosition(
+                                                                    draggedAt,
+                                                                    dragOffsetY,
+                                                                    info.map { it.offset + it.size / 2f },
+                                                                )
+                                                            neighborShift(
+                                                                meAt,
+                                                                draggedAt,
+                                                                target,
+                                                                info[draggedAt].size.toFloat(),
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                        }
+                                        .animateItemPlacement()
+                                        .pointerInput(row.song.uri) {
+                                            detectDragGesturesAfterLongPress(
+                                                onDragStart = {
+                                                    if (query.isNotBlank()) return@detectDragGesturesAfterLongPress
+                                                    if (draggingUri != null) return@detectDragGesturesAfterLongPress
+                                                    draggingUri = row.song.uri
+                                                    dragOffsetY = 0f
+                                                },
+                                                onDrag = { change, dragAmount ->
+                                                    dragOffsetY += dragAmount.y
+                                                    change.consume()
+                                                },
+                                                onDragEnd = { dropDragged() },
+                                                onDragCancel = { dropDragged() },
+                                            )
                                         },
-                                        onDrag = { change, dragAmount ->
-                                            dragOffsetY += dragAmount.y
-                                            change.consume()
-                                        },
-                                        onDragEnd = { dropDragged() },
-                                        onDragCancel = { dropDragged() },
-                                    )
-                                },
+                            )
+                        }
                     )
                 }
             }
@@ -802,7 +876,8 @@ fun QueueSheetContent(
                             .zIndex(3f)
                             .padding(bottom = 12.dp)
                             .clip(RoundedCornerShape(16.dp))
-                            .background(Color.White.copy(alpha = 0.12f))
+                            .background(FrostedChipBackground)
+                            .border(1.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(16.dp))
                             .clickable { locateCurrent() }
                             .padding(horizontal = 14.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -812,6 +887,22 @@ fun QueueSheetContent(
                     Text(text = "Canción actual", color = Color.White, fontSize = 12.sp)
                 }
             }
+        }
+        // Bottom minimize arrow: tapping this arrow minimizes the queue sheet
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onClose() }
+                .navigationBarsPadding()
+                .padding(vertical = 12.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.KeyboardArrowDown,
+                contentDescription = "Minimizar cola",
+                tint = Color.White,
+                modifier = Modifier.size(32.dp),
+            )
         }
     }
 }
@@ -834,21 +925,25 @@ private fun SortHeader(
                 .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(
+        // Every fixed-size item below has a guaranteed width; only the Spacer flexes. Before,
+        // the folder sat in the weighted slot and got squeezed to ~0 whenever the sort label
+        // plus the icon buttons filled the row.
+        Box(
             modifier =
                 Modifier
-                    .weight(1f)
+                    .size(HeaderButtonSize)
                     .clickable { onPickFolder() },
-            verticalAlignment = Alignment.CenterVertically,
+            contentAlignment = Alignment.Center,
         ) {
             Icon(
                 painter = painterResource(R.drawable.folder_24px),
-                contentDescription = null,
+                contentDescription = "Cambiar carpeta de música",
                 tint = Color.White.copy(alpha = 0.6f),
                 modifier = Modifier.size(18.dp),
             )
         }
-        IconButton(onClick = onToggleSearch) {
+        Spacer(modifier = Modifier.weight(1f))
+        IconButton(onClick = onToggleSearch, modifier = Modifier.size(HeaderButtonSize)) {
             Icon(
                 imageVector = Icons.Filled.Search,
                 contentDescription = if (searchVisible) "Ocultar búsqueda" else "Buscar",
@@ -856,7 +951,7 @@ private fun SortHeader(
                 modifier = Modifier.size(18.dp),
             )
         }
-        IconButton(onClick = onToggleDirection) {
+        IconButton(onClick = onToggleDirection, modifier = Modifier.size(HeaderButtonSize)) {
             Icon(
                 imageVector =
                     if (descending) {
@@ -882,8 +977,20 @@ private fun SortHeader(
                         .padding(horizontal = 4.dp, vertical = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(text = sortMode.label(), color = Color.White, fontSize = 13.sp)
-                Icon(imageVector = Icons.Filled.ArrowDropDown, contentDescription = null, tint = Color.White)
+                Text(
+                    text = sortMode.label(),
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = SortLabelMaxWidth),
+                )
+                Icon(
+                    imageVector = Icons.Filled.ArrowDropDown,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(20.dp),
+                )
             }
             DropdownMenu(
                 expanded = expanded,
@@ -954,6 +1061,9 @@ private fun SortMode.label(): String =
 
 private val DraggedRowBackground = Color(0xFF2A2A2A)
 
+/** Near-opaque dark "frosted" fill for floating chips: rows beneath only faintly show through. */
+private val FrostedChipBackground = Color(0xFF1C1C1E).copy(alpha = 0.88f)
+
 @Composable
 private fun QueueRowItem(
     modifier: Modifier = Modifier,
@@ -980,25 +1090,6 @@ private fun QueueRowItem(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = row.song.title,
-                color = if (row.isCurrent) accent else Color.White,
-                fontWeight = if (row.isCurrent) FontWeight.SemiBold else FontWeight.Normal,
-                fontSize = 16.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Spacer(modifier = Modifier.height(2.dp))
-            Text(
-                text = row.song.artist,
-                color = Color.White.copy(alpha = 0.6f),
-                fontSize = 13.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        Spacer(modifier = Modifier.width(12.dp))
         if (row.isCurrent) {
             Box(
                 modifier =
@@ -1018,6 +1109,25 @@ private fun QueueRowItem(
                 text = row.durationText,
                 color = Color.White.copy(alpha = 0.6f),
                 fontSize = 12.sp,
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = row.song.title,
+                color = if (row.isCurrent) accent else Color.White,
+                fontWeight = if (row.isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                fontSize = 16.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = row.song.artist,
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }

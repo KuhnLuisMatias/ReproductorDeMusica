@@ -34,6 +34,17 @@ class QueueManager {
         currentQueue = moved
     }
 
+    /**
+     * Removes an item at [index] from the current queue.
+     * Bounds-safe no-op; reassigns [currentQueue] immutably.
+     */
+    fun removeItem(index: Int) {
+        if (index !in currentQueue.indices) return
+        val mutable = currentQueue.toMutableList()
+        mutable.removeAt(index)
+        currentQueue = mutable
+    }
+
     private fun Song.toMediaItem(): MediaItem {
         val metadata =
             MediaMetadata.Builder()

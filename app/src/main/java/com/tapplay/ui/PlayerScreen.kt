@@ -13,6 +13,7 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
@@ -47,13 +48,13 @@ import com.tapplay.TapPlayApplication
 import com.tapplay.player.PlaybackManager
 import com.tapplay.player.PlayerUiState
 import com.tapplay.player.ScanPhase
-import com.tapplay.ui.components.MinimalProgressBar
 import com.tapplay.ui.components.PlayPauseTransientOverlay
 import com.tapplay.ui.components.QueueSheetBackground
 import com.tapplay.ui.components.QueueSheetContent
 import com.tapplay.ui.components.SongInfo
 import com.tapplay.ui.components.VolumeIndicatorOverlay
 import com.tapplay.ui.components.backdropEffect
+import com.tapplay.ui.components.formatDuration
 import com.tapplay.ui.components.pushRecentSearch
 import com.tapplay.ui.components.queueBackdrop
 import com.tapplay.ui.components.queueRows
@@ -147,6 +148,7 @@ fun PlayerScreen() {
 
     ModalBottomSheetLayout(
         sheetState = sheetState,
+        sheetShape = RoundedCornerShape(24.dp),
         sheetBackgroundColor = QueueSheetBackground,
         scrimColor = Color.Transparent, // R2: Transparent IS specified → M2 Scrim keeps the tap-dismiss hit box
         sheetContent = {
@@ -165,12 +167,14 @@ fun PlayerScreen() {
                 },
                 onRowTap = { index -> playbackManager.jumpTo(index) },
                 onMoveRow = { from, to -> playbackManager.moveQueueItem(from, to) },
+                onRemoveRow = { index -> playbackManager.removeFromQueue(index) },
                 onQueryChanged = { query -> playbackManager.onQueryChanged(query) },
                 onPickFolder = {
                     scope.launch { sheetState.hide() }
                     folderPickerFlow.onFolderIconTapped()
                 },
                 onTogglePlayPause = { playbackManager.togglePlayPause() },
+                onClose = { scope.launch { sheetState.hide() } },
                 scrollAnchorUri = scrollAnchorUri,
                 onScrollAnchorChanged = { uri ->
                     scrollAnchorUri = uri
@@ -293,15 +297,16 @@ fun PlayerScreen() {
                 modifier = Modifier.align(Alignment.Center),
             )
 
-            // Bottom Segmented Vertical Block Progress Bar
-            MinimalProgressBar(
-                positionMs = state.positionMs,
-                durationMs = state.durationMs,
-                onSeek = { targetMs -> playbackManager.seekTo(targetMs) },
+            // Remaining time, in place of the old animated progress bar (no motion, no drag-seek —
+            // seeking stays available via the left/right ±10s tap zones).
+            Text(
+                text = formatDuration((state.durationMs - state.positionMs).coerceAtLeast(0L)),
+                color = Color.White.copy(alpha = 0.35f),
+                fontSize = 13.sp,
                 modifier =
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(start = 32.dp, end = 32.dp, bottom = 48.dp),
+                        .padding(bottom = 48.dp),
             )
 
             // Full-screen volume wash while dragging; fades out once the finger lifts.
