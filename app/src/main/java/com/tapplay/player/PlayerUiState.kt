@@ -8,7 +8,6 @@ data class PlayerUiState(
     val isPlaying: Boolean = false,
     val currentSong: Song? = null,
     val durationMs: Long = 0L,
-    val positionMs: Long = 0L,
     val queue: List<Song> = emptyList(),
     val currentIndex: Int = -1,
     val scanLoaded: Int = 0,

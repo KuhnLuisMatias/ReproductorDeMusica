@@ -61,7 +61,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -414,8 +413,17 @@ fun QueueSheetContent(
     // anchor was saved yet (or it fell out of the queue).
     var anchorRestored by remember { mutableStateOf(false) }
     LaunchedEffect(isVisible) {
-        anchorRestored = false
-        if (!isVisible) return@LaunchedEffect
+        if (!isVisible) {
+            // Persist the anchor once, on close. Saving it per row crossed recomposed the
+            // whole player screen and rewrote the prefs file (queue snapshot included) during
+            // every scroll. Skipped until a restore has run, so an untouched index 0 never
+            // overwrites a real saved anchor.
+            if (anchorRestored && query.isBlank()) {
+                visibleRows.getOrNull(listState.firstVisibleItemIndex)?.song?.uri?.let(onScrollAnchorChanged)
+            }
+            anchorRestored = false
+            return@LaunchedEffect
+        }
         val targetRow =
             if (query.isBlank()) {
                 anchorIndex(visibleRows, scrollAnchorUri) ?: visibleRows.indexOfFirst { it.isCurrent }
@@ -424,19 +432,6 @@ fun QueueSheetContent(
             }
         if (targetRow >= 0) listState.scrollToItem(targetRow)
         anchorRestored = true
-    }
-
-    // Persists the first visible row's uri as the new scroll anchor, but only
-    // once the restore above has run — otherwise the initial index-0 render
-    // would overwrite a real saved anchor before it's even applied.
-    LaunchedEffect(isVisible, anchorRestored) {
-        if (!isVisible || !anchorRestored) return@LaunchedEffect
-        snapshotFlow { listState.firstVisibleItemIndex }
-            .collect { index ->
-                if (query.isBlank()) {
-                    visibleRows.getOrNull(index)?.song?.uri?.let(onScrollAnchorChanged)
-                }
-            }
     }
 
     fun locateCurrent() {

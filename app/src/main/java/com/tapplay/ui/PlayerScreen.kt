@@ -46,7 +46,6 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tapplay.TapPlayApplication
 import com.tapplay.player.PlaybackManager
-import com.tapplay.player.PlayerUiState
 import com.tapplay.player.ScanPhase
 import com.tapplay.ui.components.PlayPauseTransientOverlay
 import com.tapplay.ui.components.QueueSheetBackground
@@ -65,6 +64,7 @@ import com.tapplay.util.SwipeDirection
 import com.tapplay.util.passiveLongPress
 import com.tapplay.util.tapPlayGestures
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.max
 
@@ -132,7 +132,13 @@ fun PlayerScreen() {
         animationSpec = tween(durationMillis = 250),
         label = "queueBackdropAmount",
     )
-    val backdrop = backdropEffect(sdkInt = Build.VERSION.SDK_INT, amount = backdropAmount)
+    // Fully open, the sheet covers 100% of the screen, so the backdrop is only ever visible
+    // mid-animation. Skip it at rest instead of re-blurring an invisible player every tick.
+    val backdrop =
+        backdropEffect(
+            sdkInt = Build.VERSION.SDK_INT,
+            amount = if (backdropAmount >= 1f) 0f else backdropAmount,
+        )
 
     val density = LocalDensity.current
     val bottomExclusionPx =
@@ -153,7 +159,9 @@ fun PlayerScreen() {
         scrimColor = Color.Transparent, // R2: Transparent IS specified → M2 Scrim keeps the tap-dismiss hit box
         sheetContent = {
             QueueSheetContent(
-                rows = queueRows(state.queue, state.currentIndex),
+                // The sheet stays composed while hidden, so rebuilding one QueueRow per song on
+                // every recomposition is real work; only redo it when the queue or current track changes.
+                rows = remember(state.queue, state.currentIndex) { queueRows(state.queue, state.currentIndex) },
                 accent = accent,
                 sortMode = state.queueSortMode,
                 descending = state.queueSortDescending,
@@ -201,7 +209,6 @@ fun PlayerScreen() {
                             handleGesture(
                                 action = action,
                                 playbackManager = playbackManager,
-                                state = state,
                                 onCenterTap = {
                                     if (state.queue.isEmpty()) {
                                         folderPickerFlow.onFolderIconTapped()
@@ -299,10 +306,9 @@ fun PlayerScreen() {
 
             // Remaining time, in place of the old animated progress bar (no motion, no drag-seek —
             // seeking stays available via the left/right ±10s tap zones).
-            Text(
-                text = formatDuration((state.durationMs - state.positionMs).coerceAtLeast(0L)),
-                color = Color.White.copy(alpha = 0.35f),
-                fontSize = 13.sp,
+            RemainingTimeLabel(
+                positionMs = playbackManager.positionMs,
+                durationMs = state.durationMs,
                 modifier =
                     Modifier
                         .align(Alignment.BottomCenter)
@@ -370,7 +376,6 @@ private suspend fun requestPostNotificationsIfNeeded(
 private fun handleGesture(
     action: GestureAction,
     playbackManager: PlaybackManager,
-    state: PlayerUiState,
     onCenterTap: () -> Unit,
     onVolumeDragChanged: (Boolean) -> Unit,
 ) {
@@ -378,8 +383,8 @@ private fun handleGesture(
         is GestureAction.Tap ->
             when (action.zone) {
                 GestureZone.CENTER -> onCenterTap()
-                GestureZone.LEFT -> seekBy(playbackManager, state, -SEEK_STEP_MS)
-                GestureZone.RIGHT -> seekBy(playbackManager, state, SEEK_STEP_MS)
+                GestureZone.LEFT -> playbackManager.seekBy(-SEEK_STEP_MS)
+                GestureZone.RIGHT -> playbackManager.seekBy(SEEK_STEP_MS)
             }
         is GestureAction.DoubleTap ->
             when (action.zone) {
@@ -402,11 +407,21 @@ private fun handleGesture(
     }
 }
 
-private fun seekBy(
-    playbackManager: PlaybackManager,
-    state: PlayerUiState,
-    deltaMs: Long,
+/**
+ * Only composable that reads the position flow, so the twice-a-second tick recomposes this
+ * label alone instead of the whole player screen.
+ */
+@Composable
+private fun RemainingTimeLabel(
+    positionMs: StateFlow<Long>,
+    durationMs: Long,
+    modifier: Modifier = Modifier,
 ) {
-    val target = (state.positionMs + deltaMs).coerceIn(0L, state.durationMs)
-    playbackManager.seekTo(target)
+    val position by positionMs.collectAsStateWithLifecycle()
+    Text(
+        text = formatDuration((durationMs - position).coerceAtLeast(0L)),
+        color = Color.White.copy(alpha = 0.35f),
+        fontSize = 13.sp,
+        modifier = modifier,
+    )
 }

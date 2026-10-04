@@ -71,6 +71,11 @@ class PlaybackManager(
     private val _volumePercent = MutableStateFlow(volumePercentFor(currentStreamVolume()))
     val volumePercent: StateFlow<Int> = _volumePercent.asStateFlow()
 
+    // Kept out of PlayerUiState on purpose: it ticks twice a second, and inside the shared
+    // state it recomposed the whole player screen (queue sheet included) on every tick.
+    private val _positionMs = MutableStateFlow(0L)
+    val positionMs: StateFlow<Long> = _positionMs.asStateFlow()
+
     private val playerListener =
         object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -160,6 +165,14 @@ class PlaybackManager(
     fun seekTo(positionMs: Long) {
         controller?.seekTo(positionMs)
         updateState()
+    }
+
+    /** Relative seek from the controller's live position (not the last UI tick), clamped to the track. */
+    fun seekBy(deltaMs: Long) {
+        val mediaController = controller ?: return
+        val duration = mediaController.duration
+        val target = (mediaController.currentPosition + deltaMs).coerceAtLeast(0L)
+        seekTo(if (duration != C.TIME_UNSET) target.coerceAtMost(duration) else target)
     }
 
     /**
@@ -509,7 +522,7 @@ class PlaybackManager(
     }
 
     private fun persistPosition() {
-        prefs.positionMs = controller?.currentPosition ?: _uiState.value.positionMs
+        prefs.positionMs = controller?.currentPosition ?: _positionMs.value
     }
 
     private fun currentStreamVolume(): Int = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -525,7 +538,7 @@ class PlaybackManager(
         tickerJob =
             scope.launch {
                 while (isActive) {
-                    _uiState.update { it.copy(positionMs = controller?.currentPosition ?: 0L) }
+                    _positionMs.value = controller?.currentPosition ?: 0L
                     delay(POSITION_TICK_MS)
                 }
             }
@@ -536,12 +549,12 @@ class PlaybackManager(
         val index = mediaController.currentMediaItemIndex
         val song = queueManager.currentQueue.getOrNull(index)
         val duration = mediaController.duration
+        _positionMs.value = mediaController.currentPosition
         _uiState.update {
             it.copy(
                 isPlaying = mediaController.isPlaying,
                 currentSong = song,
                 durationMs = if (duration != C.TIME_UNSET) duration else 0L,
-                positionMs = mediaController.currentPosition,
                 queue = queueManager.currentQueue,
                 currentIndex = index,
             )
