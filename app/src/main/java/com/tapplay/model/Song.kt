@@ -7,7 +7,6 @@ data class Song(
     val artist: String,
     val album: String,
     val durationMs: Long,
-    val artBytes: ByteArray?,
     val lastModified: Long? = null,
     val addedAtMs: Long? = null,
 )

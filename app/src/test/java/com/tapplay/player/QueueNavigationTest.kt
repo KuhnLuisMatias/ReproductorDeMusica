@@ -18,7 +18,6 @@ class QueueNavigationTest {
         artist = artist,
         album = "album",
         durationMs = 0L,
-        artBytes = null,
     )
 
     // matchesQuery (R13/R17)

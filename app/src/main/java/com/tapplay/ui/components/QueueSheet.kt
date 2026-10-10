@@ -88,6 +88,7 @@ import com.tapplay.model.Song
 import com.tapplay.player.SortMode
 import com.tapplay.player.matchesQuery
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** Queue sheet palette (spec: queue-view "Sheet visual palette"). */
@@ -118,6 +119,16 @@ fun formatDuration(ms: Long): String {
     val seconds = totalSeconds % 60L
     return "$minutes:${seconds.toString().padStart(2, '0')}"
 }
+
+/** Threshold for animate-vs-jump in locateCurrent: rows beyond this glide instantly. */
+const val SCROLL_ANIMATE_MAX_DISTANCE = 15
+
+/** Animated glide only for short jumps; long jumps scroll instantly (perf). */
+fun shouldAnimateScroll(
+    currentRow: Int,
+    firstVisibleItemIndex: Int,
+    maxDistance: Int = SCROLL_ANIMATE_MAX_DISTANCE,
+): Boolean = abs(currentRow - firstVisibleItemIndex) <= maxDistance
 
 /** Builds the sheet row models: current-track highlight + formatted duration. */
 fun queueRows(
@@ -150,6 +161,18 @@ fun filterRows(
     } else {
         rows.filter { it.song.matchesQuery(query) }
     }
+
+/**
+ * Pure pinned-bar visibility (JVM-tested, queue-instant S3): the bar shows only
+ * when there is a rendered list AND a current playing track. Callers pass the
+ * rows the sheet will render (so an empty/fully-filtered list hides the bar)
+ * and the current song's uri derived from the FULL row list (so playback state,
+ * not viewport state, decides the current side). A filter that still matches
+ * rows does not hide the bar even if the current row itself is filtered out —
+ * the bar reflects playback, not the visible viewport.
+ */
+fun shouldShowPinnedBar(rows: List<QueueRow>, currentUri: String?): Boolean =
+    rows.isNotEmpty() && currentUri != null
 
 /**
  * Pure drag math (JVM-tested, no Compose types): [centers] holds each visible
@@ -249,8 +272,8 @@ fun scrollbarThumb(
 /**
  * Pure scroll-anchor lookup (JVM-tested, design C2): index of the row whose
  * song uri equals [uri], or null when [uri] is null or not present (e.g. the
- * saved anchor was dropped from the queue) — callers fall back to the
- * current-track jump in that case.
+ * saved anchor was dropped from the queue) — callers fall back to index 0 in
+ * that case.
  */
 fun anchorIndex(
     rows: List<QueueRow>,
@@ -402,15 +425,18 @@ fun QueueSheetContent(
     val visibleRows = remember(rows, query) { filterRows(rows, query) }
     var draggingUri by remember { mutableStateOf<String?>(null) }
     var dragOffsetY by remember { mutableStateOf(0f) }
+    var dragCenters by remember { mutableStateOf<List<Float>?>(null) }
     var scrubIndex by remember { mutableStateOf<Int?>(null) }
 
     val allArtists = remember(rows) { rows.map { it.song.artist }.distinct() }
     val artistSuggestions = remember(query, allArtists) { artistSuggestionsFor(allArtists, query) }
     val currentArtist = remember(rows) { rows.firstOrNull { it.isCurrent }?.song?.artist }
 
-    // Restore the saved scroll anchor whenever the sheet is opened with a blank
-    // query (design C2); the current-track jump is only the fallback when no
-    // anchor was saved yet (or it fell out of the queue).
+    // R3.7 (user-flagged, behavior decision): with the current track pinned
+    // to the bottom bar and the locate chip for on-demand jumps, opening the
+    // sheet no longer auto-scrolls to the playing song. Anchor restore is the
+    // only scroll intent; no saved anchor (or anchor no longer in the queue)
+    // opens at index 0.
     var anchorRestored by remember { mutableStateOf(false) }
     LaunchedEffect(isVisible) {
         if (!isVisible) {
@@ -424,24 +450,31 @@ fun QueueSheetContent(
             anchorRestored = false
             return@LaunchedEffect
         }
-        val targetRow =
-            if (query.isBlank()) {
-                anchorIndex(visibleRows, scrollAnchorUri) ?: visibleRows.indexOfFirst { it.isCurrent }
-            } else {
-                visibleRows.indexOfFirst { it.isCurrent }
-            }
-        if (targetRow >= 0) listState.scrollToItem(targetRow)
+        listState.scrollToItem(anchorIndex(visibleRows, scrollAnchorUri) ?: 0)
         anchorRestored = true
     }
 
     fun locateCurrent() {
         val currentRow = visibleRows.indexOfFirst { it.isCurrent }
-        if (currentRow >= 0) scope.launch { listState.animateScrollToItem(currentRow) }
+        if (currentRow < 0) return
+        scope.launch {
+            val firstVisible = listState.firstVisibleItemIndex
+            if (shouldAnimateScroll(currentRow, firstVisible)) {
+                listState.animateScrollToItem(currentRow)
+            } else {
+                listState.scrollToItem(currentRow)
+            }
+        }
     }
 
-    // Reads listState.layoutInfo (snapshot-backed) but only triggers recomposition of
-    // the chip below when the boolean flips — not on every pixel scrolled.
-    val currentUri = remember(rows) { rows.firstOrNull { it.isCurrent }?.song?.uri }
+    // Pinned now-playing bar state (S3): the current row is derived from the FULL
+    // row list (playback state, not viewport state), so a filter that drops the
+    // current row still leaves the bar visible.
+    val pinnedRow = remember(rows) { rows.firstOrNull { it.isCurrent } }
+    // currentUri reads listState.layoutInfo (snapshot-backed, via currentRowOffscreen
+    // below) but only triggers recomposition of the chip when the boolean flips —
+    // not on every pixel scrolled.
+    val currentUri = remember(rows) { pinnedRow?.song?.uri }
     val currentRowOffscreen by remember(currentUri) {
         derivedStateOf {
             currentUri != null && listState.layoutInfo.visibleItemsInfo.none { it.key == currentUri }
@@ -459,9 +492,21 @@ fun QueueSheetContent(
         val draggedAt = visibleRows.indexOfFirst { it.song.uri == draggingUri }
         val info = listState.layoutInfo.visibleItemsInfo
         val draggedAtInfo = info.indexOfFirst { it.key == draggingUri }
+        val centersSnapshot = dragCenters
         val targetViewportIndex =
             if (draggedAt >= 0 && draggedAtInfo >= 0) {
-                targetPosition(draggedAtInfo, dragOffsetY, info.map { it.offset + it.size / 2f })
+                // ponytail: centers snapshot is taken at drag start and never refreshed
+                // mid-drag (no auto-scroll exists). If visibleItemsInfo changed during the
+                // drag (row entered viewport) or snapshot is null, recompute that one list
+                // here — drop-only cost. If auto-scroll ever ships, refresh dragCenters per
+                // drag frame in onDrag instead.
+                val centers =
+                    if (centersSnapshot != null && centersSnapshot.size == info.size) {
+                        centersSnapshot
+                    } else {
+                        info.map { it.offset + it.size / 2f }
+                    }
+                targetPosition(draggedAtInfo, dragOffsetY, centers)
             } else {
                 draggedAtInfo
             }
@@ -478,6 +523,7 @@ fun QueueSheetContent(
         val to = visibleRows.getOrNull(target.coerceIn(visibleRows.indices))?.index
         draggingUri = null
         dragOffsetY = 0f
+        dragCenters = null
         if (from != null && to != null && from != to) onMoveRow(from, to)
     }
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp).dp
@@ -486,15 +532,18 @@ fun QueueSheetContent(
             Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp, bottomStart = 28.dp, bottomEnd = 28.dp))
-                .background(QueueSheetBackground),
+                .background(QueueSheetBackground)
+                // R3.2 (LOAD-BEARING): the sheet's height cap moves here, above ALL
+                // children — otherwise full-height list + trigger + pinned bar + footer
+                // overflow the sheet. The list keeps weight(1f, fill = false), so short
+                // queues still hug content and the bar sits flush.
+                .heightIn(max = maxSheetHeight),
     ) {
         SortHeader(
             sortMode = sortMode,
             descending = descending,
-            searchVisible = searchVisible,
             onSortSelected = onSortSelected,
             onToggleDirection = onToggleDirection,
-            onToggleSearch = { searchVisible = !searchVisible },
             onPickFolder = {
                 onQueryChanged("")
                 query = ""
@@ -502,6 +551,266 @@ fun QueueSheetContent(
                 onPickFolder()
             },
         )
+        // weight(fill = false): the footer below is measured first, so the list can never
+        // push it off the bottom of the screen; the list still wraps short content.
+        BoxWithConstraints(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false),
+        ) {
+            LazyColumn(
+                modifier =
+                    Modifier
+                        .fillMaxSize()
+                        .zIndex(if (draggingUri != null) 2f else 0f)
+                        .queueScrollbar(listState, ScrollbarColor),
+                state = listState,
+            ) {
+                if (visibleRows.isEmpty()) {
+                    item {
+                        Column(
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Text(
+                                text = "Sin resultados",
+                                color = Color.White.copy(alpha = 0.6f),
+                                fontSize = 14.sp,
+                                textAlign = TextAlign.Center,
+                            )
+                            if (query.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = "Buscar \"$query\" en YouTube",
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    modifier =
+                                        Modifier
+                                            .clip(RoundedCornerShape(16.dp))
+                                            .background(Color.White.copy(alpha = 0.12f))
+                                            .clickable { onSearchYoutube(query) }
+                                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+                itemsIndexed(visibleRows, key = { _, row -> row.song.uri }, contentType = { _, _ -> "queueRow" }) { index, row ->
+                    if (index > 0) {
+                        Box(
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .height(1.dp)
+                                    .background(SeparatorColor),
+                        )
+                    }
+                    val dismissState = rememberDismissState(
+                        confirmStateChange = { dismissValue ->
+                            if (dismissValue == DismissValue.DismissedToStart) {
+                                onRemoveRow(row.index)
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    )
+                    SwipeToDismiss(
+                        state = dismissState,
+                        directions = setOf(DismissDirection.EndToStart),
+                        background = {
+                            val isDismissing = dismissState.dismissDirection == DismissDirection.EndToStart
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(if (isDismissing) Color(0xFFE53935) else Color.Transparent)
+                                    .padding(horizontal = 20.dp),
+                                contentAlignment = Alignment.CenterEnd
+                            ) {
+                                if (isDismissing) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.End
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Delete,
+                                            contentDescription = "Remover",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "REMOVER",
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 14.sp
+                                        )
+                                    }
+                                }
+                            }
+                        },
+                        dismissContent = {
+                            QueueRowItem(
+                                row = row,
+                                accent = accent,
+                                onRowTap = onRowTap,
+                                isDragging = row.song.uri == draggingUri,
+                                isPlaying = isPlaying,
+                                onTogglePlayPause = onTogglePlayPause,
+                                modifier =
+                                    Modifier
+                                        .zIndex(if (row.song.uri == draggingUri) 1f else 0f)
+                                        .graphicsLayer {
+                                            translationY =
+                                                when {
+                                                    row.song.uri == draggingUri -> dragOffsetY
+                                                    draggingUri == null -> 0f
+                                                    else -> {
+                                                        val centers = dragCenters
+                                                        val info = listState.layoutInfo.visibleItemsInfo
+                                                        if (centers == null || centers.size != info.size) {
+                                                            0f
+                                                        } else {
+                                                            val draggedAt = info.indexOfFirst { it.key == draggingUri }
+                                                            val meAt = info.indexOfFirst { it.key == row.song.uri }
+                                                            if (draggedAt < 0 || meAt < 0) {
+                                                                0f
+                                                            } else {
+                                                                val target =
+                                                                    targetPosition(
+                                                                        draggedAt,
+                                                                        dragOffsetY,
+                                                                        centers,
+                                                                    )
+                                                                neighborShift(
+                                                                    meAt,
+                                                                    draggedAt,
+                                                                    target,
+                                                                    info[draggedAt].size.toFloat(),
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                        }
+                                        .animateItemPlacement()
+                                        .pointerInput(row.song.uri) {
+                                            detectDragGesturesAfterLongPress(
+                                                onDragStart = {
+                                                    if (query.isNotBlank()) return@detectDragGesturesAfterLongPress
+                                                    if (draggingUri != null) return@detectDragGesturesAfterLongPress
+                                                    draggingUri = row.song.uri
+                                                    dragOffsetY = 0f
+                                                    dragCenters = listState.layoutInfo.visibleItemsInfo.map { it.offset + it.size / 2f }
+                                                },
+                                                onDrag = { change, dragAmount ->
+                                                    dragOffsetY += dragAmount.y
+                                                    change.consume()
+                                                },
+                                                onDragEnd = { dropDragged() },
+                                                onDragCancel = { dropDragged() },
+                                            )
+                                        },
+                            )
+                        }
+                    )
+                }
+            }
+
+            // Invisible hit strip over the scrollbar's trailing edge: grabbing
+            // and dragging anywhere along it scrubs the list (scrollbarDragToIndex),
+            // instead of only reflecting position passively.
+            Box(
+                modifier =
+                    Modifier
+                        .align(Alignment.CenterEnd)
+                        .fillMaxHeight()
+                        .width(ScrollbarHitWidth)
+                        .zIndex(1f)
+                        .then(
+                            if (draggingUri == null) {
+                                Modifier.pointerInput(visibleRows.size) {
+                                    fun updateScrub(y: Float) {
+                                        val visibleItems = listState.layoutInfo.visibleItemsInfo.size
+                                        scrubIndex =
+                                            scrollbarDragToIndex(
+                                                dragY = y,
+                                                totalItems = visibleRows.size,
+                                                visibleItems = visibleItems,
+                                                viewportPx = size.height.toFloat(),
+                                                minThumbPx = ScrollbarMinThumbHeight.toPx(),
+                                            )
+                                    }
+                                    detectDragGestures(
+                                        onDragStart = { offset -> updateScrub(offset.y) },
+                                        onDrag = { change, _ ->
+                                            updateScrub(change.position.y)
+                                            change.consume()
+                                        },
+                                        onDragEnd = { scrubIndex = null },
+                                        onDragCancel = { scrubIndex = null },
+                                    )
+                                }
+                            } else {
+                                Modifier
+                            },
+                        ),
+            )
+
+            // Floating label previewing the artist you'd land on, following the
+            // scrub position while dragging the scrollbar.
+            val previewIndex = scrubIndex
+            if (previewIndex != null && visibleRows.isNotEmpty()) {
+                val fraction =
+                    if (visibleRows.size > 1) previewIndex.toFloat() / (visibleRows.size - 1) else 0f
+                val previewY = (maxHeight - ScrubPreviewHeight).coerceAtLeast(0.dp) * fraction
+                Text(
+                    text = visibleRows.getOrNull(previewIndex)?.song?.artist.orEmpty(),
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier =
+                        Modifier
+                            .align(Alignment.TopEnd)
+                            .zIndex(3f)
+                            .padding(end = 40.dp)
+                            .offset(y = previewY)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color.Black.copy(alpha = 0.8f))
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            }
+
+            // Contextual chip: only takes header space when it's actually useful,
+            // i.e. you've scrolled the currently playing track out of view. Hidden
+            // while dragging so it never competes with the drag handle for attention.
+            if (currentRowOffscreen && draggingUri == null) {
+                Row(
+                    modifier =
+                        Modifier
+                            .align(Alignment.BottomCenter)
+                            .zIndex(3f)
+                            .padding(bottom = 12.dp)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(FrostedChipBackground)
+                            .border(1.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(16.dp))
+                            .clickable { locateCurrent() }
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    LocateCurrentIcon(tint = Color.White, modifier = Modifier.size(14.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(text = "Canción actual", color = Color.White, fontSize = 12.sp)
+                }
+            }
+        }
+        // S3: the search complex re-parented VERBATIM from its former post-header
+        // position — it now sits BELOW the list, bottom-anchored above the trigger row.
         if (searchVisible) {
             Row(
                 modifier =
@@ -630,258 +939,36 @@ fun QueueSheetContent(
                 }
             }
         }
-        // weight(fill = false): the footer below is measured first, so the list can never
-        // push it off the bottom of the screen; the list still wraps short content.
-        BoxWithConstraints(
+        // S3: bottom-anchored search trigger — directly above the pinned bar.
+        Row(
             modifier =
                 Modifier
                     .fillMaxWidth()
-                    .weight(1f, fill = false)
-                    .heightIn(max = maxSheetHeight),
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            LazyColumn(
-                modifier =
-                    Modifier
-                        .fillMaxSize()
-                        .zIndex(if (draggingUri != null) 2f else 0f)
-                        .queueScrollbar(listState, ScrollbarColor),
-                state = listState,
+            IconButton(
+                onClick = { searchVisible = true },
+                modifier = Modifier.size(HeaderButtonSize),
             ) {
-                if (visibleRows.isEmpty()) {
-                    item {
-                        Column(
-                            modifier =
-                                Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 24.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Text(
-                                text = "Sin resultados",
-                                color = Color.White.copy(alpha = 0.6f),
-                                fontSize = 14.sp,
-                                textAlign = TextAlign.Center,
-                            )
-                            if (query.isNotBlank()) {
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Text(
-                                    text = "Buscar \"$query\" en YouTube",
-                                    color = Color.White,
-                                    fontSize = 13.sp,
-                                    modifier =
-                                        Modifier
-                                            .clip(RoundedCornerShape(16.dp))
-                                            .background(Color.White.copy(alpha = 0.12f))
-                                            .clickable { onSearchYoutube(query) }
-                                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                                )
-                            }
-                        }
-                    }
-                }
-                itemsIndexed(visibleRows, key = { _, row -> row.song.uri }) { index, row ->
-                    if (index > 0) {
-                        Box(
-                            modifier =
-                                Modifier
-                                    .fillMaxWidth()
-                                    .height(1.dp)
-                                    .background(SeparatorColor),
-                        )
-                    }
-                    val dismissState = rememberDismissState(
-                        confirmStateChange = { dismissValue ->
-                            if (dismissValue == DismissValue.DismissedToStart) {
-                                onRemoveRow(row.index)
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                    )
-                    SwipeToDismiss(
-                        state = dismissState,
-                        directions = setOf(DismissDirection.EndToStart),
-                        background = {
-                            val isDismissing = dismissState.dismissDirection == DismissDirection.EndToStart
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .background(if (isDismissing) Color(0xFFE53935) else Color.Transparent)
-                                    .padding(horizontal = 20.dp),
-                                contentAlignment = Alignment.CenterEnd
-                            ) {
-                                if (isDismissing) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.End
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Filled.Delete,
-                                            contentDescription = "Remover",
-                                            tint = Color.White,
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(
-                                            text = "REMOVER",
-                                            color = Color.White,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 14.sp
-                                        )
-                                    }
-                                }
-                            }
-                        },
-                        dismissContent = {
-                            QueueRowItem(
-                                row = row,
-                                accent = accent,
-                                onRowTap = onRowTap,
-                                isDragging = row.song.uri == draggingUri,
-                                isPlaying = isPlaying,
-                                onTogglePlayPause = onTogglePlayPause,
-                                modifier =
-                                    Modifier
-                                        .zIndex(if (row.song.uri == draggingUri) 1f else 0f)
-                                        .graphicsLayer {
-                                            translationY =
-                                                when {
-                                                    row.song.uri == draggingUri -> dragOffsetY
-                                                    draggingUri == null -> 0f
-                                                    else -> {
-                                                        val info = listState.layoutInfo.visibleItemsInfo
-                                                        val draggedAt = info.indexOfFirst { it.key == draggingUri }
-                                                        val meAt = info.indexOfFirst { it.key == row.song.uri }
-                                                        if (draggedAt < 0 || meAt < 0) {
-                                                            0f
-                                                        } else {
-                                                            val target =
-                                                                targetPosition(
-                                                                    draggedAt,
-                                                                    dragOffsetY,
-                                                                    info.map { it.offset + it.size / 2f },
-                                                                )
-                                                            neighborShift(
-                                                                meAt,
-                                                                draggedAt,
-                                                                target,
-                                                                info[draggedAt].size.toFloat(),
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                        }
-                                        .animateItemPlacement()
-                                        .pointerInput(row.song.uri) {
-                                            detectDragGesturesAfterLongPress(
-                                                onDragStart = {
-                                                    if (query.isNotBlank()) return@detectDragGesturesAfterLongPress
-                                                    if (draggingUri != null) return@detectDragGesturesAfterLongPress
-                                                    draggingUri = row.song.uri
-                                                    dragOffsetY = 0f
-                                                },
-                                                onDrag = { change, dragAmount ->
-                                                    dragOffsetY += dragAmount.y
-                                                    change.consume()
-                                                },
-                                                onDragEnd = { dropDragged() },
-                                                onDragCancel = { dropDragged() },
-                                            )
-                                        },
-                            )
-                        }
-                    )
-                }
-            }
-
-            // Invisible hit strip over the scrollbar's trailing edge: grabbing
-            // and dragging anywhere along it scrubs the list (scrollbarDragToIndex),
-            // instead of only reflecting position passively.
-            Box(
-                modifier =
-                    Modifier
-                        .align(Alignment.CenterEnd)
-                        .fillMaxHeight()
-                        .width(ScrollbarHitWidth)
-                        .zIndex(1f)
-                        .then(
-                            if (draggingUri == null) {
-                                Modifier.pointerInput(visibleRows.size) {
-                                    fun updateScrub(y: Float) {
-                                        val visibleItems = listState.layoutInfo.visibleItemsInfo.size
-                                        scrubIndex =
-                                            scrollbarDragToIndex(
-                                                dragY = y,
-                                                totalItems = visibleRows.size,
-                                                visibleItems = visibleItems,
-                                                viewportPx = size.height.toFloat(),
-                                                minThumbPx = ScrollbarMinThumbHeight.toPx(),
-                                            )
-                                    }
-                                    detectDragGestures(
-                                        onDragStart = { offset -> updateScrub(offset.y) },
-                                        onDrag = { change, _ ->
-                                            updateScrub(change.position.y)
-                                            change.consume()
-                                        },
-                                        onDragEnd = { scrubIndex = null },
-                                        onDragCancel = { scrubIndex = null },
-                                    )
-                                }
-                            } else {
-                                Modifier
-                            },
-                        ),
-            )
-
-            // Floating label previewing the artist you'd land on, following the
-            // scrub position while dragging the scrollbar.
-            val previewIndex = scrubIndex
-            if (previewIndex != null && visibleRows.isNotEmpty()) {
-                val fraction =
-                    if (visibleRows.size > 1) previewIndex.toFloat() / (visibleRows.size - 1) else 0f
-                val previewY = (maxHeight - ScrubPreviewHeight).coerceAtLeast(0.dp) * fraction
-                Text(
-                    text = visibleRows.getOrNull(previewIndex)?.song?.artist.orEmpty(),
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier =
-                        Modifier
-                            .align(Alignment.TopEnd)
-                            .zIndex(3f)
-                            .padding(end = 40.dp)
-                            .offset(y = previewY)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color.Black.copy(alpha = 0.8f))
-                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                Icon(
+                    imageVector = Icons.Filled.Search,
+                    contentDescription = "Buscar",
+                    tint = Color.White.copy(alpha = 0.6f),
+                    modifier = Modifier.size(18.dp),
                 )
             }
-
-            // Contextual chip: only takes header space when it's actually useful,
-            // i.e. you've scrolled the currently playing track out of view. Hidden
-            // while dragging so it never competes with the drag handle for attention.
-            if (currentRowOffscreen && draggingUri == null) {
-                Row(
-                    modifier =
-                        Modifier
-                            .align(Alignment.BottomCenter)
-                            .zIndex(3f)
-                            .padding(bottom = 12.dp)
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(FrostedChipBackground)
-                            .border(1.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(16.dp))
-                            .clickable { locateCurrent() }
-                            .padding(horizontal = 14.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    LocateCurrentIcon(tint = Color.White, modifier = Modifier.size(14.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(text = "Canción actual", color = Color.White, fontSize = 12.sp)
-                }
-            }
+        }
+        // S3: pinned now-playing bar — a Column sibling of the list, NOT a LazyColumn
+        // row: it never scrolls and is always visible however far the list is scrolled.
+        if (shouldShowPinnedBar(rows = visibleRows, currentUri = pinnedRow?.song?.uri) && pinnedRow != null) {
+            PinnedNowPlayingBar(
+                row = pinnedRow,
+                accent = accent,
+                isPlaying = isPlaying,
+                onTogglePlayPause = onTogglePlayPause,
+            )
         }
         // Bottom minimize arrow: tapping this arrow minimizes the queue sheet
         Box(
@@ -906,10 +993,8 @@ fun QueueSheetContent(
 private fun SortHeader(
     sortMode: SortMode,
     descending: Boolean,
-    searchVisible: Boolean,
     onSortSelected: (SortMode) -> Unit,
     onToggleDirection: () -> Unit,
-    onToggleSearch: () -> Unit,
     onPickFolder: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -938,14 +1023,6 @@ private fun SortHeader(
             )
         }
         Spacer(modifier = Modifier.weight(1f))
-        IconButton(onClick = onToggleSearch, modifier = Modifier.size(HeaderButtonSize)) {
-            Icon(
-                imageVector = Icons.Filled.Search,
-                contentDescription = if (searchVisible) "Ocultar búsqueda" else "Buscar",
-                tint = Color.White.copy(alpha = 0.6f),
-                modifier = Modifier.size(18.dp),
-            )
-        }
         IconButton(onClick = onToggleDirection, modifier = Modifier.size(HeaderButtonSize)) {
             Icon(
                 imageVector =
@@ -1112,6 +1189,69 @@ private fun QueueRowItem(
                 text = row.song.title,
                 color = if (row.isCurrent) accent else Color.White,
                 fontWeight = if (row.isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                fontSize = 16.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = row.song.artist,
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/**
+ * Static bottom bar for the currently playing track (queue-instant S3): a
+ * sibling of the LazyColumn — it never scrolls and is not an overlay, so no
+ * contentInset / bottom-padding math is needed and the bar is always visible
+ * however far the list is scrolled. Reuses the shared PlayPauseGlyph and the
+ * same 28dp-hit/16dp-glyph anatomy as QueueRowItem's in-row button.
+ */
+@Composable
+private fun PinnedNowPlayingBar(
+    row: QueueRow,
+    accent: Color,
+    isPlaying: Boolean,
+    onTogglePlayPause: () -> Unit,
+) {
+    Box(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .height(1.dp)
+                .background(SeparatorColor),
+    )
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .background(QueueSheetBackground)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier =
+                Modifier
+                    .size(28.dp)
+                    .clickable { onTogglePlayPause() },
+            contentAlignment = Alignment.Center,
+        ) {
+            PlayPauseGlyph(
+                isPlaying = isPlaying,
+                tint = accent,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = row.song.title,
+                color = Color.White,
                 fontSize = 16.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,

@@ -11,6 +11,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -61,7 +62,6 @@ import com.tapplay.util.GestureAction
 import com.tapplay.util.GestureHandler
 import com.tapplay.util.GestureZone
 import com.tapplay.util.SwipeDirection
-import com.tapplay.util.passiveLongPress
 import com.tapplay.util.tapPlayGestures
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.StateFlow
@@ -116,9 +116,14 @@ fun PlayerScreen() {
     // skipHalfExpanded: the sheet is capped at 100% of screen height (see maxSheetHeight
     // in QueueSheetContent), which is tall enough that M2 would otherwise offer a
     // HalfExpanded stop on the way up — show() should jump straight to full height.
+    // S2 (queue-instant): snap() drives every animated transition of this state —
+    // show(), hide() and swipe-down dismiss all settle instantly (AC4/AC5);
+    // the API has no per-transition split, so instant swipe-dismiss is an
+    // accepted behavior change (flagged in the commit message).
     val sheetState =
         rememberModalBottomSheetState(
             initialValue = ModalBottomSheetValue.Hidden,
+            animationSpec = snap(),
             skipHalfExpanded = true,
         )
     BackHandler(enabled = sheetState.isVisible) {
@@ -217,7 +222,7 @@ fun PlayerScreen() {
                                         tapTriggerCount++
                                     }
                                 },
-                                onVolumeDragChanged = { isAdjustingVolume = it },
+                                 onVolumeDragChanged = { isAdjustingVolume = it },
                             )
                         },
                         topExclusionPx = topExclusionPx,
@@ -289,11 +294,11 @@ fun PlayerScreen() {
                 SongInfo(
                     title = song?.title ?: if (state.queue.isEmpty()) "Toca para abrir carpeta" else "Sin título",
                     artist = song?.artist ?: if (state.queue.isEmpty()) "TapPlay" else "Desconocido",
-                    modifier =
-                        Modifier.passiveLongPress(
-                            enabled = !sheetState.isVisible,
-                            onLongPress = { scope.launch { sheetState.show() } },
-                        ),
+                    onHoldToOpen = {
+                        scope.launch {
+                            if (!sheetState.isVisible) sheetState.show()
+                        }
+                    },
                 )
             }
 
@@ -392,6 +397,8 @@ private fun handleGesture(
                 GestureZone.LEFT -> playbackManager.previous()
                 GestureZone.RIGHT -> playbackManager.next()
             }
+        // LongPress is intentionally a no-op here: queue-open moved to a hold
+        // gesture on the artist text inside SongInfo (hold-glow).
         is GestureAction.LongPress -> Unit
         is GestureAction.HorizontalSwipe ->
             when (action.direction) {

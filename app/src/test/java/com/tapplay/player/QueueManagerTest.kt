@@ -16,7 +16,6 @@ class QueueManagerTest {
             artist = "artist",
             album = "album",
             durationMs = 0L,
-            artBytes = null,
         )
 
     @Test

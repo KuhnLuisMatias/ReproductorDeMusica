@@ -13,7 +13,6 @@ class QueueRemovalTest {
             artist = "Artist $id",
             album = "Album $id",
             durationMs = 180000L,
-            artBytes = null,
             lastModified = 1000L,
         )
 

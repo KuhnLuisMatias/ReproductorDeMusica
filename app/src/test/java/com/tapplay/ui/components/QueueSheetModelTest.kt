@@ -20,7 +20,6 @@ class QueueSheetModelTest {
         artist = artist,
         album = album,
         durationMs = durationMs,
-        artBytes = null,
     )
 
     @Test
@@ -455,5 +454,46 @@ class QueueSheetModelTest {
         val target = resolveDropTarget(rows, visibleKeys, targetViewportIndex = 0, fallback = 0)
 
         assertEquals(0, target)
+    }
+
+    // ---- shouldAnimateScroll: distance-aware locate glide vs instant jump (C4) ----
+
+    @Test
+    fun `shouldAnimateScroll glides within threshold and jumps beyond it`() {
+        assertTrue(shouldAnimateScroll(currentRow = 15, firstVisibleItemIndex = 0))
+        assertFalse(shouldAnimateScroll(currentRow = 16, firstVisibleItemIndex = 0))
+        assertTrue(shouldAnimateScroll(currentRow = 0, firstVisibleItemIndex = 15))
+    }
+
+    // ---- shouldShowPinnedBar: pinned-bar visibility (queue-instant S3) ----
+
+    @Test
+    fun `shouldShowPinnedBar shows when rows and current uri are both present`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 1)
+
+        assertTrue(shouldShowPinnedBar(rows, currentUri = rows[1].song.uri))
+    }
+
+    @Test
+    fun `shouldShowPinnedBar hides on an empty row list`() {
+        assertFalse(shouldShowPinnedBar(emptyList(), currentUri = "content://tree/a"))
+    }
+
+    @Test
+    fun `shouldShowPinnedBar hides when nothing is current`() {
+        val rows = queueRows(listOf(song("a", 0L)), currentIndex = -1)
+
+        assertFalse(shouldShowPinnedBar(rows, currentUri = null))
+    }
+
+    @Test
+    fun `shouldShowPinnedBar ignores filtering — playback keeps the bar visible`() {
+        val rows = queueRows(
+            listOf(song("a", 0L, artist = "zeta"), song("b", 0L), song("c", 0L)),
+            currentIndex = 1,
+        )
+        val filtered = filterRows(rows, "zeta") // current row "b" filtered OUT
+
+        assertTrue(shouldShowPinnedBar(filtered, currentUri = rows[1].song.uri))
     }
 }

@@ -267,9 +267,10 @@ private suspend fun AwaitPointerEventScope.awaitTapOutcome(
             return GestureHandler.resolveZone(down.position.x, size.width.toFloat())
         }
         if (change.isConsumed && !isSwiping) {
-            // A1b: a sibling (e.g. SongInfo's passiveLongPress) started consuming
-            // this pointer mid-press — abort so a drag afterward never emits a
-            // swipe or volume step on top of it.
+            // A1b: a child modifier that consumes this pointer mid-press (e.g. a
+            // future long-press/drag node layered over the player) aborts the
+            // ambient gesture here, so an ongoing drag never emits a swipe or
+            // volume step on top of the child's action.
             if (volumeDragActive) onAction(GestureAction.VolumeDragEnd)
             return null
         }
@@ -314,55 +315,3 @@ private suspend fun AwaitPointerEventScope.awaitPointerUp(pointerId: PointerId) 
 }
 
 private fun Density.pxToDp(px: Float): Float = px.toDp().value
-
-/**
- * Observes a press without consuming the initial down (A1): while
- * [enabled], waits up to the platform long-press timeout for the pointer to
- * lift or drift beyond [GestureHandler.LONG_PRESS_SLOP_DP]. If neither
- * happens before the timeout, it fires [onLongPress] (the caller applies
- * haptics) and starts consuming every subsequent change for that pointer so
- * a drag afterward cannot also trigger a sibling's tap/swipe/volume drag —
- * see the sibling-side abort in `awaitTapOutcome` (A1b).
- *
- * Because the down is never consumed up front, tap-to-play, double-tap,
- * swipes and volume drags starting on the same node keep working right up
- * until the long-press threshold actually fires.
- */
-fun Modifier.passiveLongPress(
-    enabled: Boolean = true,
-    onLongPress: () -> Unit,
-): Modifier =
-    composed {
-        val currentEnabled by rememberUpdatedState(enabled)
-        val currentOnLongPress by rememberUpdatedState(onLongPress)
-        pointerInput(Unit) {
-            val longPressSlopPx = GestureHandler.LONG_PRESS_SLOP_DP.dp.toPx()
-            awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false)
-                if (!currentEnabled || down.isConsumed) return@awaitEachGesture
-                val longPressTimeoutMs = ViewConfiguration.getLongPressTimeout().toLong()
-                val firedNaturally =
-                    withTimeoutOrNull(longPressTimeoutMs) {
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == down.id } ?: return@withTimeoutOrNull false
-                            if (!change.pressed) return@withTimeoutOrNull false
-                            val dx = change.position.x - down.position.x
-                            val dy = change.position.y - down.position.y
-                            if (hypot(dx, dy) > longPressSlopPx) return@withTimeoutOrNull false
-                        }
-                        @Suppress("UNREACHABLE_CODE")
-                        false
-                    }
-                if (firedNaturally == null) {
-                    currentOnLongPress()
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == down.id } ?: return@awaitEachGesture
-                        if (!change.pressed) return@awaitEachGesture
-                        change.consume()
-                    }
-                }
-            }
-        }
-    }

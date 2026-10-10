@@ -51,11 +51,6 @@ class QueueManager {
                 .setTitle(title)
                 .setArtist(artist)
                 .setAlbumTitle(album)
-                .apply {
-                    artBytes?.takeIf { it.isNotEmpty() }?.let {
-                        setArtworkData(it, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
-                    }
-                }
                 .build()
         return MediaItem.Builder()
             .setUri(uri)

@@ -13,7 +13,6 @@ class RestoreResolverTest {
             artist = "Desconocido",
             album = "Sin álbum",
             durationMs = 0L,
-            artBytes = null,
         )
 
     private val queue = listOf(song("a.mp3"), song("b.mp3"), song("c.mp3"))

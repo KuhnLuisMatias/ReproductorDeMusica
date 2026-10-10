@@ -80,7 +80,6 @@ object MusicScanner {
                     artist = metadata.artist,
                     album = metadata.album,
                     durationMs = metadata.durationMs,
-                    artBytes = null,
                     lastModified = cachedByUri[documentUri]?.lastModified,
                     addedAtMs = cachedByUri[documentUri]?.addedAtMs ?: System.currentTimeMillis(),
                 ).also { onProgress(done.incrementAndGet(), ordered.size) }
@@ -143,7 +142,6 @@ internal fun CachedTrack.toSong(): Song =
         artist = artist,
         album = album,
         durationMs = durationMs,
-        artBytes = null,
         lastModified = lastModified,
         addedAtMs = addedAtMs,
     )

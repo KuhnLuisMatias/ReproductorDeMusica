@@ -18,7 +18,6 @@ class SortModeTest {
         artist = artist,
         album = "album",
         durationMs = 1_000L,
-        artBytes = null,
         lastModified = lastModified,
         addedAtMs = addedAtMs,
     )
