@@ -102,3 +102,50 @@ fun engagementIndex(
     val target = if (forward) index + 1 else index - 1
     return if (target in subset.indices) target else null
 }
+
+/**
+ * Plans the timeline edits transforming [current] into [sorted] as a sequence
+ * of index moves (remove-then-insert — same semantics as QueueManager.moveItem
+ * and MediaController.moveMediaItem).
+ *
+ * Greedy index repair: for each target position i, find where sorted[i]
+ * currently sits in the evolving list and move it to i. One sweep suffices: a
+ * fixed point invariant holds — after filling slot i, slots 0..i match sorted,
+ * and sorted[i] can never be found in 0..i-1 (those slots hold earlier,
+ * distinct values), so every search index satisfies j >= i and moves never
+ * disturb filled slots. Indices inside the returned pairs are LIVE indices:
+ * each (from, to) is valid in the list state AFTER all earlier moves were
+ * applied, not in the original input.
+ *
+ * Precondition (same assumption the queue LazyColumn's `key = song.uri`
+ * already makes, QueueSheet L602): [current] and [sorted] contain the same
+ * songs with unique uris. Duplicate-uri behavior is out of contract.
+ *
+ * ponytail: greedy in O(n) moves worst case (n indexOf scans -> O(n^2) total).
+ * Upgrade path: minimal-moves via LIS only if profiling ever shows jank on
+ * huge queues.
+ */
+fun surgicalMoves(current: List<String>, sorted: List<String>): List<Pair<Int, Int>> {
+    val work = current.toMutableList()
+    val moves = mutableListOf<Pair<Int, Int>>()
+    for (i in sorted.indices) {
+        val j = work.indexOf(sorted[i])
+        if (j != i) {
+            moves += j to i
+            work.add(i, work.removeAt(j))
+        }
+    }
+    return moves
+}
+
+/**
+ * Applies surgicalMoves output: each pair is one remove-then-insert move on
+ * the evolving list — the executable simulation of the controller + mirror
+ * move pair (QueueManager.moveItem run in sequence). Pure; used by
+ * QueueManagerTest to verify plans end-to-end.
+ */
+fun applyMoves(current: List<String>, moves: List<Pair<Int, Int>>): List<String> {
+    val work = current.toMutableList()
+    for ((from, to) in moves) work.add(to, work.removeAt(from))
+    return work
+}

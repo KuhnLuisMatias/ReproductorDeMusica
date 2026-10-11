@@ -354,13 +354,17 @@ class PlaybackManager(
     }
 
     /**
-     * Reorders the live queue to [mode] keeping the current song playing at its
-     * position (setMediaItems + seekTo; repeatMode untouched). Persists the mode
-     * first; DATE_MODIFIED lazily fetches missing lastModified values once (one
-     * bounded pass, merged in memory and persisted into the metadata cache).
-     * No indicator during the fetch (see design D0.9).
-     * While filtered, operates on the captured full queue and re-swaps the sorted
-     * subset when the current song matches (self-heals holds); otherwise stays holding.
+     * Reorders the live queue to [mode] keeping the current song playing at
+     * its position — surgically, with controller.moveMediaItem index moves
+     * instead of a timeline rebuild, so playback NEVER re-prepares (no dip).
+     * Persists the mode first; DATE_MODIFIED lazily fetches missing
+     * lastModified values once (one bounded pass, merged in memory and
+     * persisted into the metadata cache). No indicator during the fetch
+     * (design D0.9).
+     * While filtered, operates on the captured full queue and re-swaps the
+     * sorted subset via swapTimeline when the current song matches (self-heals
+     * holds; unchanged — re-prepare there is a pre-existing ceiling);
+     * otherwise stays holding.
      */
     suspend fun reorderQueue(
         mode: SortMode,
@@ -389,13 +393,23 @@ class PlaybackManager(
         val sorted = SortMode.apply(songs, mode, descending)
         fullQueue = if (wasFiltered) sorted else null
         persistQueueSnapshot(sorted) // always the FULL list (base was full or the captured full queue) — R10
-        val currentPath = _uiState.value.currentSong?.path
         if (!wasFiltered) {
-            val newIndex = sorted.indexOfFirst { it.path == currentPath }.takeIf { it >= 0 } ?: 0
-            val positionMs = mediaController.currentPosition // MUST be read BEFORE setMediaItems (reads 0 after)
-            mediaController.setMediaItems(queueManager.buildMediaItems(sorted))
-            mediaController.seekTo(newIndex, positionMs)
+            // Surgical in-place reorder: plan the moves that transform the live
+            // timeline into `sorted`, then execute them one by one. No
+            // setMediaItems, no seekTo, no currentPath/positionMs capture — the
+            // playing item is never re-prepared, so playback is continuous
+            // (when the current item itself moves, Media3 only shifts
+            // currentIndex to follow it — same semantics as moveQueueItem).
+            val moves = surgicalMoves(
+                current = queueManager.currentQueue.map { it.uri },
+                sorted = sorted.map { it.uri },
+            )
+            for ((from, to) in moves) {
+                mediaController.moveMediaItem(from, to)
+                queueManager.moveItem(from, to) // mirror per-move (moveQueueItem precedent L427–428)
+            }
         } else {
+            val currentPath = _uiState.value.currentSong?.path
             val subset = sorted.filter { it.matchesQuery(activeQuery) }
             val indexInSubset = subset.indexOfFirst { it.path == currentPath } // sign matters: absence = hold (D4)
             if (indexInSubset >= 0) {

@@ -465,35 +465,96 @@ class QueueSheetModelTest {
         assertTrue(shouldAnimateScroll(currentRow = 0, firstVisibleItemIndex = 15))
     }
 
-    // ---- shouldShowPinnedBar: pinned-bar visibility (queue-instant S3) ----
+    // ---- shouldShowPinnedBar: pinned-bar visibility (queue-polish S1) ----
 
     @Test
-    fun `shouldShowPinnedBar shows when rows and current uri are both present`() {
+    fun `shouldShowPinnedBar shows when current row is offscreen`() {
         val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 1)
 
-        assertTrue(shouldShowPinnedBar(rows, currentUri = rows[1].song.uri))
+        assertTrue(
+            shouldShowPinnedBar(
+                rows,
+                currentUri = rows[1].song.uri,
+                currentRowOffscreen = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `shouldShowPinnedBar hides when current row is onscreen`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 1)
+
+        assertFalse(
+            shouldShowPinnedBar(
+                rows,
+                currentUri = rows[1].song.uri,
+                currentRowOffscreen = false,
+            ),
+        )
     }
 
     @Test
     fun `shouldShowPinnedBar hides on an empty row list`() {
-        assertFalse(shouldShowPinnedBar(emptyList(), currentUri = "content://tree/a"))
+        assertFalse(
+            shouldShowPinnedBar(
+                emptyList(),
+                currentUri = "content://tree/a",
+                currentRowOffscreen = true,
+            ),
+        )
     }
 
     @Test
     fun `shouldShowPinnedBar hides when nothing is current`() {
         val rows = queueRows(listOf(song("a", 0L)), currentIndex = -1)
 
-        assertFalse(shouldShowPinnedBar(rows, currentUri = null))
+        assertFalse(
+            shouldShowPinnedBar(
+                rows,
+                currentUri = null,
+                currentRowOffscreen = true,
+            ),
+        )
     }
 
     @Test
-    fun `shouldShowPinnedBar ignores filtering — playback keeps the bar visible`() {
+    fun `shouldShowPinnedBar filtered-out current row counts as offscreen`() {
         val rows = queueRows(
             listOf(song("a", 0L, artist = "zeta"), song("b", 0L), song("c", 0L)),
             currentIndex = 1,
         )
         val filtered = filterRows(rows, "zeta") // current row "b" filtered OUT
 
-        assertTrue(shouldShowPinnedBar(filtered, currentUri = rows[1].song.uri))
+        assertTrue(
+            shouldShowPinnedBar(
+                filtered,
+                currentUri = rows[1].song.uri,
+                currentRowOffscreen = true,
+            ),
+        )
+    }
+
+    // ---- searchTrailingAction: stateful trailing control (search-style R8) ----
+
+    @Test
+    fun `searchTrailingAction with blank query renders nothing when focused`() {
+        assertNull(searchTrailingAction("", isFocused = true))
+        assertNull(searchTrailingAction("   ", isFocused = true))
+    }
+
+    @Test
+    fun `searchTrailingAction with blank query renders nothing when unfocused`() {
+        assertNull(searchTrailingAction("", isFocused = false))
+        assertNull(searchTrailingAction("   ", isFocused = false))
+    }
+
+    @Test
+    fun `searchTrailingAction shows the erase button when focused with text`() {
+        assertEquals(SearchTrailing.CLOSE, searchTrailingAction("beatles", isFocused = true))
+    }
+
+    @Test
+    fun `searchTrailingAction shows the broom when text is present but unfocused`() {
+        assertEquals(SearchTrailing.BROOM, searchTrailingAction("beatles", isFocused = false))
     }
 }

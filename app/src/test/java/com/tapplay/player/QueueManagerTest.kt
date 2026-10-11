@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class QueueManagerTest {
@@ -94,5 +95,52 @@ class QueueManagerTest {
 
         assertEquals(listOf("a", "b", "c"), manager.currentQueue.map { it.title })
         assertSame(before, manager.currentQueue)
+    }
+
+    // ---- surgicalMoves / applyMoves: greedy transform plan (queue-polish S2) ----
+
+    private fun movesTransforms(current: List<String>, sorted: List<String>) =
+        applyMoves(current, surgicalMoves(current, sorted)) == sorted
+
+    @Test
+    fun `surgicalMoves identity is empty`() {
+        val list = listOf("a", "b", "c")
+        assertEquals(emptyList<Pair<Int, Int>>(), surgicalMoves(list, list))
+    }
+
+    @Test
+    fun `surgicalMoves swap yields one move and applies to sorted`() {
+        val moves = surgicalMoves(listOf("a", "b", "c"), listOf("b", "a", "c"))
+        assertEquals(listOf(1 to 0), moves)
+        assertTrue(movesTransforms(listOf("a", "b", "c"), listOf("b", "a", "c")))
+    }
+
+    @Test
+    fun `surgicalMoves reversal yields two greedy moves and applies`() {
+        val moves = surgicalMoves(listOf("a", "b", "c"), listOf("c", "b", "a"))
+        assertEquals(listOf(2 to 0, 2 to 1), moves)
+        assertEquals(listOf("c", "b", "a"), applyMoves(listOf("a", "b", "c"), moves))
+    }
+
+    @Test
+    fun `surgicalMoves current-at-front yields two moves covering rotation`() {
+        val current = listOf("a", "b", "c")
+        val sorted = listOf("b", "c", "a")
+        assertEquals(2, surgicalMoves(current, sorted).size)
+        assertTrue(movesTransforms(current, sorted))
+    }
+
+    @Test
+    fun `surgicalMoves scaled partial shuffle applies to sorted`() {
+        val sorted = listOf("a", "b", "c", "d", "e", "f", "g", "h")
+        val shuffled = listOf("c", "a", "h", "b", "g", "d", "f", "e")
+        val moves = surgicalMoves(shuffled, sorted)
+        assertTrue(moves.isNotEmpty())
+        assertEquals(sorted, applyMoves(shuffled, moves)) // load-bearing: simulates moveMediaItem sequence
+    }
+
+    @Test
+    fun `surgicalMoves both empty is empty`() {
+        assertEquals(emptyList<Pair<Int, Int>>(), surgicalMoves(emptyList(), emptyList()))
     }
 }

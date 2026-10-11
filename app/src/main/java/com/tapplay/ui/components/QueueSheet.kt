@@ -47,12 +47,10 @@ import androidx.compose.material.SwipeToDismiss
 import androidx.compose.material.rememberDismissState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -65,9 +63,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -163,16 +163,41 @@ fun filterRows(
     }
 
 /**
- * Pure pinned-bar visibility (JVM-tested, queue-instant S3): the bar shows only
- * when there is a rendered list AND a current playing track. Callers pass the
- * rows the sheet will render (so an empty/fully-filtered list hides the bar)
- * and the current song's uri derived from the FULL row list (so playback state,
- * not viewport state, decides the current side). A filter that still matches
- * rows does not hide the bar even if the current row itself is filtered out —
- * the bar reflects playback, not the visible viewport.
+ * Pure pinned-bar visibility (queue-polish S1): the bar shows only when there
+ * is a rendered list, a current playing track, AND the current row is
+ * offscreen — hidden on open-at-current (new regime), appears on scroll-away,
+ * hides again at the scrolled-to destination. [currentRowOffscreen] is derived
+ * structural state (currentRowOffscreen derivedStateOf): a filtered-out
+ * current row is constantly offscreen (its uri key never appears in the
+ * LazyColumn), so "current filtered out -> bar visible; tap is a locate
+ * no-op" (handled at locateCurrent, not here). [rows] is what the sheet will
+ * render so an empty/fully-filtered-from-empty list hides the bar; [currentUri]
+ * is derived from the FULL row list (playback state, not viewport state).
  */
-fun shouldShowPinnedBar(rows: List<QueueRow>, currentUri: String?): Boolean =
-    rows.isNotEmpty() && currentUri != null
+fun shouldShowPinnedBar(
+    rows: List<QueueRow>,
+    currentUri: String?,
+    currentRowOffscreen: Boolean,
+): Boolean =
+    rows.isNotEmpty() && currentUri != null && currentRowOffscreen
+
+/** Which trailing control the search field shows, if any (search-style R3/R7). */
+enum class SearchTrailing { CLOSE, BROOM }
+
+/**
+ * Pure seam (JVM-tested, no Compose): text + focused → X (erase-to-keep-typing);
+ * text + unfocused → broom; blank in ANY focus state → null (no control rendered).
+ * Blank == isNotBlank — parity with the IME Search predicate (BasicTextField L~816).
+ */
+fun searchTrailingAction(
+    query: String,
+    isFocused: Boolean,
+): SearchTrailing? =
+    when {
+        query.isNotBlank() && isFocused -> SearchTrailing.CLOSE
+        query.isNotBlank() -> SearchTrailing.BROOM
+        else -> null
+    }
 
 /**
  * Pure drag math (JVM-tested, no Compose types): [centers] holds each visible
@@ -418,8 +443,8 @@ fun QueueSheetContent(
     }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    var searchVisible by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    var searchFocused by remember { mutableStateOf(false) }
     // Only recomputed when the queue or the query actually changes — not on every
     // scrub/scroll recomposition, which would otherwise re-filter the whole list per frame.
     val visibleRows = remember(rows, query) { filterRows(rows, query) }
@@ -429,7 +454,14 @@ fun QueueSheetContent(
     var scrubIndex by remember { mutableStateOf<Int?>(null) }
 
     val allArtists = remember(rows) { rows.map { it.song.artist }.distinct() }
-    val artistSuggestions = remember(query, allArtists) { artistSuggestionsFor(allArtists, query) }
+    // Blank query shows ALL artists (the row is lazy, so unbounded is fine);
+    // non-blank keeps the capped, filtered suggestions from artistSuggestionsFor.
+    // This wins the blank slot over the recents row below, which now only fires
+    // when the queue has no artists at all.
+    val artistSuggestions =
+        remember(query, allArtists) {
+            if (query.isBlank()) allArtists else artistSuggestionsFor(allArtists, query)
+        }
     val currentArtist = remember(rows) { rows.firstOrNull { it.isCurrent }?.song?.artist }
 
     // R3.7 (user-flagged, behavior decision): with the current track pinned
@@ -472,7 +504,7 @@ fun QueueSheetContent(
     // current row still leaves the bar visible.
     val pinnedRow = remember(rows) { rows.firstOrNull { it.isCurrent } }
     // currentUri reads listState.layoutInfo (snapshot-backed, via currentRowOffscreen
-    // below) but only triggers recomposition of the chip when the boolean flips —
+    // below) but only triggers recomposition of the BAR when the boolean flips —
     // not on every pixel scrolled.
     val currentUri = remember(rows) { pinnedRow?.song?.uri }
     val currentRowOffscreen by remember(currentUri) {
@@ -539,6 +571,181 @@ fun QueueSheetContent(
                 // queues still hug content and the bar sits flush.
                 .heightIn(max = maxSheetHeight),
     ) {
+        // S3: artist-suggestion chips render ABOVE the field so tapping one never
+        // scrolls the field out of reach under the keyboard; recents stay below.
+        if (artistSuggestions.isNotEmpty()) {
+            LazyRow(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(artistSuggestions) { artist ->
+                    Text(
+                        text = artist,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier =
+                            Modifier
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color.White.copy(alpha = 0.1f))
+                                .clickable {
+                                    query = artist
+                                    onQueryChanged(artist)
+                                    onCommitSearch(artist)
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                    )
+                }
+            }
+        }
+        // Search field + suggestions, search stack now leads the sheet (queue-head C2).
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BasicTextField(
+                value = query,
+                onValueChange = {
+                    query = it
+                    onQueryChanged(it)
+                },
+                singleLine = true,
+                textStyle =
+                    LocalTextStyle.current.copy(
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        textAlign = TextAlign.Start,
+                    ),
+                cursorBrush = SolidColor(Color.White),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions =
+                    KeyboardActions(onSearch = {
+                        if (query.isNotBlank()) onCommitSearch(query)
+                    }),
+                modifier =
+                    Modifier
+                        .onFocusChanged { searchFocused = it.isFocused }
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(
+                                    Color.White.copy(alpha = 0.08f),
+                                    Color.White.copy(alpha = 0.04f),
+                                ),
+                            ),
+                        )
+                        .weight(1f),
+                decorationBox = { innerTextField ->
+                    // Trailing action lives INSIDE the pill (trailing-icon pattern):
+                    // the field keeps its full width, the icon stays within it.
+                    val trailingAction = searchTrailingAction(query, searchFocused)
+                    // Pill height grows (~48 → ~60dp): vertical padding inflates it,
+                    // while the gradient background sits OUTSIDE decorationBox on the
+                    // BasicTextField modifier chain, so it still fills the full pill.
+                    Row(
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            modifier = Modifier.weight(1f),
+                            contentAlignment = Alignment.CenterStart,
+                        ) {
+                            if (query.isEmpty()) {
+                                Text(
+                                    text = "Buscar canción o artista",
+                                    color = Color.White.copy(alpha = 0.4f),
+                                    fontSize = 15.sp,
+                                )
+                            }
+                            innerTextField()
+                        }
+                        when (trailingAction) {
+                            SearchTrailing.CLOSE ->
+                                IconButton(
+                                    onClick = {
+                                        query = ""
+                                        onQueryChanged("")
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "Borrar texto escrito",
+                                        tint = Color.White,
+                                    )
+                                }
+                            SearchTrailing.BROOM ->
+                                IconButton(
+                                    onClick = {
+                                        query = ""
+                                        onQueryChanged("")
+                                    },
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Delete,
+                                        contentDescription = "Limpiar búsqueda",
+                                        tint = Color.White,
+                                    )
+                                }
+                            null -> {}
+                        }
+                    }
+                },
+            )
+        }
+        if (artistSuggestions.isEmpty() && query.isBlank() && (currentArtist != null || recentSearches.isNotEmpty())) {
+            // Shown only when nothing is typed yet (and no artist matches): the
+            // artist currently playing (fastest way to filter to "what's on now"),
+            // then recent searches.
+            LazyRow(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                if (currentArtist != null) {
+                    item {
+                        Text(
+                            text = "▸ $currentArtist",
+                            color = accent,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier =
+                                Modifier
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(accent.copy(alpha = 0.18f))
+                                    .clickable {
+                                        query = currentArtist
+                                        onQueryChanged(currentArtist)
+                                        onCommitSearch(currentArtist)
+                                    }
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+                items(recentSearches) { recent ->
+                    Text(
+                        text = recent,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier =
+                            Modifier
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color.White.copy(alpha = 0.1f))
+                                .clickable {
+                                    query = recent
+                                    onQueryChanged(recent)
+                                    onCommitSearch(recent)
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
+                    )
+                }
+            }
+        }
         SortHeader(
             sortMode = sortMode,
             descending = descending,
@@ -547,7 +754,6 @@ fun QueueSheetContent(
             onPickFolder = {
                 onQueryChanged("")
                 query = ""
-                searchVisible = false
                 onPickFolder()
             },
         )
@@ -785,188 +991,15 @@ fun QueueSheetContent(
                             .padding(horizontal = 10.dp, vertical = 6.dp),
                 )
             }
-
-            // Contextual chip: only takes header space when it's actually useful,
-            // i.e. you've scrolled the currently playing track out of view. Hidden
-            // while dragging so it never competes with the drag handle for attention.
-            if (currentRowOffscreen && draggingUri == null) {
-                Row(
-                    modifier =
-                        Modifier
-                            .align(Alignment.BottomCenter)
-                            .zIndex(3f)
-                            .padding(bottom = 12.dp)
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(FrostedChipBackground)
-                            .border(1.dp, Color.White.copy(alpha = 0.18f), RoundedCornerShape(16.dp))
-                            .clickable { locateCurrent() }
-                            .padding(horizontal = 14.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    LocateCurrentIcon(tint = Color.White, modifier = Modifier.size(14.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(text = "Canción actual", color = Color.White, fontSize = 12.sp)
-                }
-            }
-        }
-        // S3: the search complex re-parented VERBATIM from its former post-header
-        // position — it now sits BELOW the list, bottom-anchored above the trigger row.
-        if (searchVisible) {
-            Row(
-                modifier =
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                BasicTextField(
-                    value = query,
-                    onValueChange = {
-                        query = it
-                        onQueryChanged(it)
-                    },
-                    singleLine = true,
-                    textStyle = LocalTextStyle.current.copy(color = Color.White, fontSize = 15.sp),
-                    cursorBrush = SolidColor(Color.White),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions =
-                        KeyboardActions(onSearch = {
-                            if (query.isNotBlank()) onCommitSearch(query)
-                        }),
-                    modifier = Modifier.weight(1f),
-                    decorationBox = { innerTextField ->
-                        Box {
-                            if (query.isEmpty()) {
-                                Text(
-                                    text = "Buscar canción o artista",
-                                    color = Color.White.copy(alpha = 0.4f),
-                                    fontSize = 15.sp,
-                                )
-                            }
-                            innerTextField()
-                        }
-                    },
-                )
-                IconButton(
-                    onClick = {
-                        // C3: closing with a non-blank query commits it to recents.
-                        if (query.isNotBlank()) onCommitSearch(query)
-                        query = ""
-                        onQueryChanged("")
-                        searchVisible = false
-                    },
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Close,
-                        contentDescription = "Cerrar búsqueda",
-                        tint = Color.White,
-                    )
-                }
-            }
-            if (artistSuggestions.isNotEmpty()) {
-                LazyRow(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    items(artistSuggestions) { artist ->
-                        Text(
-                            text = artist,
-                            color = Color.White,
-                            fontSize = 13.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier =
-                                Modifier
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .background(Color.White.copy(alpha = 0.1f))
-                                    .clickable {
-                                        query = artist
-                                        onQueryChanged(artist)
-                                        onCommitSearch(artist)
-                                    }
-                                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                        )
-                    }
-                }
-            } else if (query.isBlank() && (currentArtist != null || recentSearches.isNotEmpty())) {
-                // Shown only when the search field is open with nothing typed yet: the
-                // artist currently playing (fastest way to filter to "what's on now"),
-                // then recent searches.
-                LazyRow(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    if (currentArtist != null) {
-                        item {
-                            Text(
-                                text = "▸ $currentArtist",
-                                color = accent,
-                                fontSize = 13.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier =
-                                    Modifier
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(accent.copy(alpha = 0.18f))
-                                        .clickable {
-                                            query = currentArtist
-                                            onQueryChanged(currentArtist)
-                                            onCommitSearch(currentArtist)
-                                        }
-                                        .padding(horizontal = 12.dp, vertical = 6.dp),
-                            )
-                        }
-                    }
-                    items(recentSearches) { recent ->
-                        Text(
-                            text = recent,
-                            color = Color.White,
-                            fontSize = 13.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier =
-                                Modifier
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .background(Color.White.copy(alpha = 0.1f))
-                                    .clickable {
-                                        query = recent
-                                        onQueryChanged(recent)
-                                        onCommitSearch(recent)
-                                    }
-                                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                        )
-                    }
-                }
-            }
-        }
-        // S3: bottom-anchored search trigger — directly above the pinned bar.
-        Row(
-            modifier =
-                Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.End,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            IconButton(
-                onClick = { searchVisible = true },
-                modifier = Modifier.size(HeaderButtonSize),
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Search,
-                    contentDescription = "Buscar",
-                    tint = Color.White.copy(alpha = 0.6f),
-                    modifier = Modifier.size(18.dp),
-                )
-            }
         }
         // S3: pinned now-playing bar — a Column sibling of the list, NOT a LazyColumn
         // row: it never scrolls and is always visible however far the list is scrolled.
-        if (shouldShowPinnedBar(rows = visibleRows, currentUri = pinnedRow?.song?.uri) && pinnedRow != null) {
+        if (shouldShowPinnedBar(rows = visibleRows, currentUri = pinnedRow?.song?.uri, currentRowOffscreen = currentRowOffscreen) && pinnedRow != null) {
             PinnedNowPlayingBar(
                 row = pinnedRow,
                 accent = accent,
                 isPlaying = isPlaying,
+                onLocate = { locateCurrent() },
                 onTogglePlayPause = onTogglePlayPause,
             )
         }
@@ -1023,24 +1056,6 @@ private fun SortHeader(
             )
         }
         Spacer(modifier = Modifier.weight(1f))
-        IconButton(onClick = onToggleDirection, modifier = Modifier.size(HeaderButtonSize)) {
-            Icon(
-                imageVector =
-                    if (descending) {
-                        Icons.Filled.KeyboardArrowDown
-                    } else {
-                        Icons.Filled.KeyboardArrowUp
-                    },
-                contentDescription =
-                    if (descending) {
-                        "Orden descendente"
-                    } else {
-                        "Orden ascendente"
-                    },
-                tint = Color.White.copy(alpha = 0.6f),
-                modifier = Modifier.size(18.dp),
-            )
-        }
         Box {
             Row(
                 modifier =
@@ -1073,18 +1088,38 @@ private fun SortHeader(
                     DropdownMenuItem(
                         onClick = {
                             expanded = false
-                            onSortSelected(mode)
+                            // Same-mode text-tap: close-noop — reorderQueue with
+                            // identical args would be a pure-waste re-apply.
+                            if (mode != sortMode) onSortSelected(mode)
                         },
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(modifier = Modifier.width(20.dp)) {
+                            Box(modifier = Modifier.width(40.dp), contentAlignment = Alignment.CenterStart) {
                                 if (mode == sortMode) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Check,
-                                        contentDescription = null,
-                                        tint = Color.White,
-                                    )
+                                    // Arrow tap flips direction IN PLACE: does NOT set
+                                    // expanded=false → M2 menu stays open; reorderQueue
+                                    // with flipped direction re-runs → arrow + list
+                                    // flip live.
+                                    Box(
+                                        modifier =
+                                            Modifier
+                                                .size(40.dp)
+                                                .clickable { onToggleDirection() },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Icon(
+                                            imageVector =
+                                                if (descending) {
+                                                    Icons.Filled.KeyboardArrowDown
+                                                } else {
+                                                    Icons.Filled.KeyboardArrowUp
+                                                },
+                                            contentDescription = "Invertir sentido",
+                                            tint = Color.White,
+                                        )
+                                    }
                                 }
+                                // non-selected rows: empty Box, no Check (alignment parity)
                             }
                             Text(
                                 text = mode.label(),
@@ -1099,30 +1134,6 @@ private fun SortHeader(
     }
 }
 
-/** Crosshair "locate" glyph (no material-icons-extended dependency needed for one icon). */
-@Composable
-private fun LocateCurrentIcon(
-    tint: Color,
-    modifier: Modifier = Modifier,
-) {
-    Canvas(modifier = modifier) {
-        val radius = size.minDimension * 0.36f
-        val center = Offset(size.width / 2f, size.height / 2f)
-        drawCircle(color = tint, radius = radius, center = center, style = Stroke(width = size.minDimension * 0.09f))
-        drawCircle(color = tint, radius = size.minDimension * 0.08f, center = center)
-        val tickLength = size.minDimension * 0.14f
-        val strokeWidth = size.minDimension * 0.09f
-        listOf(
-            Offset(center.x, 0f) to Offset(center.x, tickLength),
-            Offset(center.x, size.height) to Offset(center.x, size.height - tickLength),
-            Offset(0f, center.y) to Offset(tickLength, center.y),
-            Offset(size.width, center.y) to Offset(size.width - tickLength, center.y),
-        ).forEach { (start, end) ->
-            drawLine(color = tint, start = start, end = end, strokeWidth = strokeWidth)
-        }
-    }
-}
-
 private fun SortMode.label(): String =
     when (this) {
         SortMode.ADDED -> "Orden de adición"
@@ -1133,9 +1144,11 @@ private fun SortMode.label(): String =
 
 private val DraggedRowBackground = Color(0xFF2A2A2A)
 
-/** Near-opaque dark "frosted" fill for floating chips: rows beneath only faintly show through. */
-private val FrostedChipBackground = Color(0xFF1C1C1E).copy(alpha = 0.88f)
-
+/**
+ * Queue row: info column left, duration right-aligned on ALL rows
+ * (beyond-ask: non-current rows' duration moved from leading to trailing
+ * position), play/pause 28dp-glyph right of duration on the current row only.
+ */
 @Composable
 private fun QueueRowItem(
     modifier: Modifier = Modifier,
@@ -1162,28 +1175,6 @@ private fun QueueRowItem(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (row.isCurrent) {
-            Box(
-                modifier =
-                    Modifier
-                        .size(28.dp)
-                        .clickable { onTogglePlayPause() },
-                contentAlignment = Alignment.Center,
-            ) {
-                PlayPauseGlyph(
-                    isPlaying = isPlaying,
-                    tint = accent,
-                    modifier = Modifier.size(16.dp),
-                )
-            }
-        } else {
-            Text(
-                text = row.durationText,
-                color = Color.White.copy(alpha = 0.6f),
-                fontSize = 12.sp,
-            )
-        }
-        Spacer(modifier = Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = row.song.title,
@@ -1202,21 +1193,46 @@ private fun QueueRowItem(
                 overflow = TextOverflow.Ellipsis,
             )
         }
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = row.durationText,
+            color = Color.White.copy(alpha = 0.6f),
+            fontSize = 12.sp,
+        )
+        if (row.isCurrent) {
+            Spacer(modifier = Modifier.width(12.dp))
+            Box(
+                modifier =
+                    Modifier
+                        .size(28.dp)
+                        .clickable { onTogglePlayPause() },
+                contentAlignment = Alignment.Center,
+            ) {
+                PlayPauseGlyph(
+                    isPlaying = isPlaying,
+                    tint = accent,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
     }
 }
 
 /**
- * Static bottom bar for the currently playing track (queue-instant S3): a
- * sibling of the LazyColumn — it never scrolls and is not an overlay, so no
- * contentInset / bottom-padding math is needed and the bar is always visible
- * however far the list is scrolled. Reuses the shared PlayPauseGlyph and the
- * same 28dp-hit/16dp-glyph anatomy as QueueRowItem's in-row button.
+ * Static bottom bar for the currently playing track (queue-instant S3,
+ * queue-polish S1): a sibling of the LazyColumn — it never scrolls and is not
+ * an overlay, so no contentInset / bottom-padding math is needed and the bar
+ * is always visible however far the list is scrolled. Tapping the song zone
+ * locates the current row (distance-aware glide/jump via locateCurrent);
+ * trailing play/pause reuses the shared PlayPauseGlyph and the same 28dp-hit/
+ * 16dp-glyph anatomy as QueueRowItem's in-row button.
  */
 @Composable
 private fun PinnedNowPlayingBar(
     row: QueueRow,
     accent: Color,
     isPlaying: Boolean,
+    onLocate: () -> Unit,
     onTogglePlayPause: () -> Unit,
 ) {
     Box(
@@ -1234,21 +1250,12 @@ private fun PinnedNowPlayingBar(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
+        Column(
             modifier =
                 Modifier
-                    .size(28.dp)
-                    .clickable { onTogglePlayPause() },
-            contentAlignment = Alignment.Center,
+                    .weight(1f)
+                    .clickable { onLocate() },
         ) {
-            PlayPauseGlyph(
-                isPlaying = isPlaying,
-                tint = accent,
-                modifier = Modifier.size(16.dp),
-            )
-        }
-        Spacer(modifier = Modifier.width(12.dp))
-        Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = row.song.title,
                 color = Color.White,
@@ -1263,6 +1270,20 @@ private fun PinnedNowPlayingBar(
                 fontSize = 13.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Box(
+            modifier =
+                Modifier
+                    .size(28.dp)
+                    .clickable { onTogglePlayPause() },
+            contentAlignment = Alignment.Center,
+        ) {
+            PlayPauseGlyph(
+                isPlaying = isPlaying,
+                tint = accent,
+                modifier = Modifier.size(16.dp),
             )
         }
     }

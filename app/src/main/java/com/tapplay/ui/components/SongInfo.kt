@@ -18,6 +18,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -26,7 +28,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.view.ViewConfiguration
+import com.tapplay.util.GestureHandler
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Artist-hero song info typography (JetBrains Mono via AppTypography):
@@ -45,7 +49,9 @@ import kotlinx.coroutines.launch
  * completes (and the queue opens), every subsequent change of this gesture is
  * consumed: the ambient GestureHandler's lift check and mid-press abort both
  * bail on consumed changes, so a stale post-open stream can never resolve a
- * toggle or a volume step from this now-dead surface.
+ * toggle or a volume step from this now-dead surface. Drift past 12dp before
+ * the timeout also drains-to-lift (all consumed), recording dead-input intent
+ * so the ambient can neither toggle nor step volume from this dead surface.
  */
 @Composable
 fun SongInfo(
@@ -86,57 +92,54 @@ fun SongInfo(
                         val holdTimeoutMs = ViewConfiguration.getLongPressTimeout()
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
-                            // Visual ramp only: pure VFX, reset any drift from the
-                            // previous gesture. It is NOT the completion source of
-                            // truth (the in-loop uptime check below is) and never
-                            // invokes anything.
+                            // Visual ramp only: pure VFX, never the completion
+                            // source of truth (the withTimeoutOrNull race below
+                            // is) and never invokes anything.
                             val ramp = scope.launch {
                                 glow.snapTo(0f)
                                 glow.animateTo(1f, tween(holdTimeoutMs, easing = LinearEasing))
                             }
-                            // Explicit event loop. NOTHING is consumed before the
-                            // hold timeout fires — that preserves the quick tap by
-                            // construction: the ambient generator still sees an
-                            // unconsumed up → Tap(CENTER) (parent toggles playback).
-                            while (true) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.firstOrNull { it.id == down.id }
-                                if (change == null || !change.pressed) {
-                                    // Early lift / cancel (or pointer lost): undo the
-                                    // ramp, consume nothing — gesture ends passively.
-                                    ramp.cancel()
+                            // Watchdog race: the deadline is a coroutine timer,
+                            // NOT an in-loop uptime check — a perfectly still
+                            // finger (zero pointer events) still resolves the
+                            // hold at ~holdTimeoutMs. Contract: null => timeout;
+                            // Held => tracked finger lifted/lost before timeout;
+                            // Abandoned => drifted > LONG_PRESS_SLOP (12dp,
+                            // shared with GestureHandler's ambient pending-press
+                            // horizon) before timeout. null is forbidden from
+                            // awaitHoldEnd, so null unambiguously means timeout.
+                            val outcome = withTimeoutOrNull(holdTimeoutMs.toLong()) {
+                                awaitHoldEnd(down, GestureHandler.LONG_PRESS_SLOP_DP.dp.toPx())
+                            }
+                            ramp.cancel() // every resolution kills the ramp
+                            when (outcome) {
+                                null -> {
+                                    // (a) Timeout: own the stream, reopen the
+                                    // queue, drain.
+                                    scope.launch { glow.snapTo(0f) }
+                                    onHoldToOpen?.invoke()
+                                    drainUntilLift()
+                                }
+                                HoldOutcome.Held -> {
+                                    // (b) Early lift/pointer-lost: reverse ~120ms,
+                                    // consume NOTHING (ambient sees unconsumed up
+                                    // → Tap → quick-tap toggle kept), no drain,
+                                    // no invoke.
                                     if (glow.value > 0f) {
                                         scope.launch { glow.animateTo(0f, tween(120)) }
                                     }
-                                    return@awaitEachGesture
                                 }
-                                if (change.uptimeMillis - down.uptimeMillis >= holdTimeoutMs) {
-                                    // Hold complete: own the pointer stream. Kill the
-                                    // ramp, reset the glow, consume the completion
-                                    // event, THEN reopen the queue, then drain every
-                                    // remaining event until the finger lifts — all
-                                    // changes consumed.
-                                    // Known accepted micro-race (proposal): a finger can
-                                    // cross the ~50dp swipe threshold inside the ~1-frame
-                                    // window between ramp completion and this check —
-                                    // ambient may emit ≤1 stray volume step. Accept (rare).
-                                    ramp.cancel()
-                                    // snapTo is a plain suspend fn: not callable in
-                                    // the restricted AwaitPointerEventScope — fire it
-                                    // on the normal scope (visual reset only).
-                                    scope.launch { glow.snapTo(0f) }
-                                    event.changes.forEach { it.consume() }
-                                    onHoldToOpen?.invoke()
-                                    break
+                                HoldOutcome.Abandoned -> {
+                                    // (c) Drift past slop = OURS (intent owned:
+                                    // glow started). Dead input: reverse + drain-
+                                    // to-lift (suppresses ambient Tap resolution /
+                                    // toggle bug). Neither open nor toggle.
+                                    if (glow.value > 0f) {
+                                        scope.launch { glow.animateTo(0f, tween(120)) }
+                                    }
+                                    drainUntilLift()
                                 }
                             }
-                            while (true) {
-                                val drain = awaitPointerEvent()
-                                drain.changes.forEach { it.consume() }
-                                if (drain.changes.none { it.pressed }) break
-                            }
-                            // Drain ended with the final lift → awaitEachGesture
-                            // starts a clean, fresh gesture on the next down.
                         }
                     }
                 },
@@ -152,5 +155,44 @@ fun SongInfo(
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+private enum class HoldOutcome { Held, Abandoned }
+
+/**
+ * Tracks only the [down]-finger until it resolves: lift / pointer-lost →
+ * [HoldOutcome.Held]; cumulative path-length drift past [slopPx] →
+ * [HoldOutcome.Abandoned]. Consumes NOTHING (the quick tap stays intact for
+ * the ambient generator until a resolution branch says otherwise) and never
+ * returns null — so a [kotlinx.coroutines.withTimeoutOrNull] null around it
+ * unambiguously means the deadline fired.
+ */
+private suspend fun AwaitPointerEventScope.awaitHoldEnd(
+    down: PointerInputChange,
+    slopPx: Float,
+): HoldOutcome {
+    var last = down.position
+    var drift = 0f
+    while (true) {
+        val event = awaitPointerEvent()
+        val change = event.changes.firstOrNull { it.id == down.id }
+        if (change == null || !change.pressed) return HoldOutcome.Held
+        drift += (change.position - last).getDistance()
+        last = change.position
+        if (drift > slopPx) return HoldOutcome.Abandoned
+    }
+}
+
+/**
+ * Consumes every change of the current gesture until no pointer is pressed:
+ * dead-input capture so the ambient GestureHandler can neither resolve a Tap
+ * nor step volume from this surface. Verbatim from the previous drain region.
+ */
+private suspend fun AwaitPointerEventScope.drainUntilLift() {
+    while (true) {
+        val drain = awaitPointerEvent()
+        drain.changes.forEach { it.consume() }
+        if (drain.changes.none { it.pressed }) break
     }
 }
