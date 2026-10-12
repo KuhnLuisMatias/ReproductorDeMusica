@@ -3,7 +3,7 @@ package com.tapplay.ui.components
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -16,6 +16,8 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Fill
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 
 /** Icon spans this fraction of the screen's shorter side — big enough to read at a glance. */
@@ -48,14 +50,16 @@ fun PlayPauseTransientOverlay(
         }
     }
 
-    BoxWithConstraints(
+    // Size from the screen, not from incoming constraints: the caller may give this a zero-height slot.
+    val configuration = LocalConfiguration.current
+    Box(
         modifier = modifier,
         contentAlignment = Alignment.Center,
     ) {
         if (alphaAnim.value > 0.01f) {
             val currentAlpha = alphaAnim.value
             val iconColor = Color.White.copy(alpha = currentAlpha)
-            val iconSize = minOf(maxWidth, maxHeight) * ICON_SCREEN_FRACTION
+            val iconSize = minOf(configuration.screenWidthDp, configuration.screenHeightDp).dp * ICON_SCREEN_FRACTION
 
             Canvas(modifier = Modifier.size(iconSize * ICON_INNER_FRACTION)) {
                 val w = size.width

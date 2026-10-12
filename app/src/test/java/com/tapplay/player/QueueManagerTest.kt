@@ -4,8 +4,8 @@ import com.tapplay.model.Song
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class QueueManagerTest {
@@ -97,50 +97,68 @@ class QueueManagerTest {
         assertSame(before, manager.currentQueue)
     }
 
-    // ---- surgicalMoves / applyMoves: greedy transform plan (queue-polish S2) ----
-
-    private fun movesTransforms(current: List<String>, sorted: List<String>) =
-        applyMoves(current, surgicalMoves(current, sorted)) == sorted
+    // ---- splitAroundCurrent / adopt: apply the sorted order around the playing song (S14) ----
 
     @Test
-    fun `surgicalMoves identity is empty`() {
-        val list = listOf("a", "b", "c")
-        assertEquals(emptyList<Pair<Int, Int>>(), surgicalMoves(list, list))
+    fun `splitAroundCurrent current at the start leaves an empty before range`() {
+        val (before, after) = splitAroundCurrent(listOf("a", "b", "c"), "a")!!
+        assertEquals(emptyList<Int>(), before.toList())
+        assertEquals(listOf(1, 2), after.toList())
     }
 
     @Test
-    fun `surgicalMoves swap yields one move and applies to sorted`() {
-        val moves = surgicalMoves(listOf("a", "b", "c"), listOf("b", "a", "c"))
-        assertEquals(listOf(1 to 0), moves)
-        assertTrue(movesTransforms(listOf("a", "b", "c"), listOf("b", "a", "c")))
+    fun `splitAroundCurrent current in the middle splits both sides`() {
+        val (before, after) = splitAroundCurrent(listOf("a", "b", "c", "d"), "c")!!
+        assertEquals(listOf(0, 1), before.toList())
+        assertEquals(listOf(3), after.toList())
     }
 
     @Test
-    fun `surgicalMoves reversal yields two greedy moves and applies`() {
-        val moves = surgicalMoves(listOf("a", "b", "c"), listOf("c", "b", "a"))
-        assertEquals(listOf(2 to 0, 2 to 1), moves)
-        assertEquals(listOf("c", "b", "a"), applyMoves(listOf("a", "b", "c"), moves))
+    fun `splitAroundCurrent current at the end leaves an empty after range`() {
+        val (before, after) = splitAroundCurrent(listOf("a", "b", "c"), "c")!!
+        assertEquals(listOf(0, 1), before.toList())
+        assertEquals(emptyList<Int>(), after.toList())
     }
 
     @Test
-    fun `surgicalMoves current-at-front yields two moves covering rotation`() {
-        val current = listOf("a", "b", "c")
-        val sorted = listOf("b", "c", "a")
-        assertEquals(2, surgicalMoves(current, sorted).size)
-        assertTrue(movesTransforms(current, sorted))
+    fun `splitAroundCurrent returns null when the current uri is absent`() {
+        assertNull(splitAroundCurrent(listOf("a", "b"), "z"))
     }
 
     @Test
-    fun `surgicalMoves scaled partial shuffle applies to sorted`() {
-        val sorted = listOf("a", "b", "c", "d", "e", "f", "g", "h")
-        val shuffled = listOf("c", "a", "h", "b", "g", "d", "f", "e")
-        val moves = surgicalMoves(shuffled, sorted)
-        assertTrue(moves.isNotEmpty())
-        assertEquals(sorted, applyMoves(shuffled, moves)) // load-bearing: simulates moveMediaItem sequence
+    fun `shouldWriteSnapshot only for the same adopted reference`() {
+        val sorted = listOf(song("a"), song("b"))
+        assertEquals(true, shouldWriteSnapshot(sorted, sorted))
+        assertEquals(false, shouldWriteSnapshot(sorted.toList(), sorted)) // equal content, newer reference
     }
 
     @Test
-    fun `surgicalMoves both empty is empty`() {
-        assertEquals(emptyList<Pair<Int, Int>>(), surgicalMoves(emptyList(), emptyList()))
+    fun `isStaleReorder discards when the controller changed`() {
+        val q = listOf(song("a"))
+        val c1 = Any()
+        assertEquals(false, isStaleReorder(c1, c1, q, q, null, null, "", ""))
+        assertEquals(true, isStaleReorder(c1, Any(), q, q, null, null, "", ""))
+        assertEquals(true, isStaleReorder(c1, null, q, q, null, null, "", ""))
+    }
+
+    @Test
+    fun `isStaleReorder keeps discarding on queue or query changes`() {
+        val q = listOf(song("a"))
+        val c = Any()
+        assertEquals(true, isStaleReorder(c, c, q, q.toList(), null, null, "", ""))
+        assertEquals(true, isStaleReorder(c, c, q, q, null, q, "", ""))
+        assertEquals(true, isStaleReorder(c, c, q, q, null, null, "", "x"))
+    }
+
+    @Test
+    fun `adopt replaces currentQueue with the new order in one assignment`() {
+        val manager = QueueManager()
+        manager.buildMediaItems(listOf(song("a"), song("b"), song("c")))
+        val sorted = listOf(song("c"), song("b"), song("a"))
+
+        manager.adopt(sorted)
+
+        assertSame(sorted, manager.currentQueue)
+        assertEquals(sorted.map { it.title }, toMediaItems(sorted).map { it.mediaMetadata.title })
     }
 }

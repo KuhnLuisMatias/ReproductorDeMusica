@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -14,14 +15,19 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemGestures
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.material.ExperimentalMaterialApi
 import androidx.compose.material.LinearProgressIndicator
 import androidx.compose.material.ModalBottomSheetLayout
@@ -34,13 +40,19 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -49,6 +61,7 @@ import com.tapplay.TapPlayApplication
 import com.tapplay.player.PlaybackManager
 import com.tapplay.player.ScanPhase
 import com.tapplay.ui.components.PlayPauseTransientOverlay
+import com.tapplay.ui.components.QueueChevronCenterFromBottom
 import com.tapplay.ui.components.QueueSheetBackground
 import com.tapplay.ui.components.QueueSheetContent
 import com.tapplay.ui.components.SongInfo
@@ -68,8 +81,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.max
 
-private const val SEEK_STEP_MS = 10_000L
 private const val DEFAULT_ACCENT = 0xFF8E8E93
+private val TimeTouchHeight = 48.dp
 
 @OptIn(ExperimentalMaterialApi::class)
 @Composable
@@ -279,45 +292,61 @@ fun PlayerScreen() {
             }
 
             // Typography: Centered in the upper-middle area (blurs during volume drag)
-            Column(
+            Box(
                 modifier =
                     Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 32.dp)
                         .align(Alignment.Center)
-                        .padding(bottom = 120.dp)
-                        .then(
-                            if (songInfoBlur > 0.dp) Modifier.blur(songInfoBlur) else Modifier
-                        ),
-                horizontalAlignment = Alignment.CenterHorizontally,
+                        .padding(bottom = 120.dp),
             ) {
-                SongInfo(
-                    title = song?.title ?: if (state.queue.isEmpty()) "Toca para abrir carpeta" else "Sin título",
-                    artist = song?.artist ?: if (state.queue.isEmpty()) "TapPlay" else "Desconocido",
-                    onHoldToOpen = {
-                        scope.launch {
-                            if (!sheetState.isVisible) sheetState.show()
-                        }
-                    },
+                Column(
+                    modifier =
+                        Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (songInfoBlur > 0.dp) Modifier.blur(songInfoBlur) else Modifier
+                            ),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    SongInfo(
+                        title = song?.title ?: if (state.queue.isEmpty()) "Toca para abrir carpeta" else "Sin título",
+                        artist = song?.artist ?: if (state.queue.isEmpty()) "TapPlay" else "Desconocido",
+                    )
+                }
+
+                // Transient Play/Pause icon, anchored to the bottom edge of the song block (below the
+                // title): zero layout footprint (height 0 + unbounded), outside the blur, no pointerInput
+                // so a center tap still reaches the ambient detector.
+                PlayPauseTransientOverlay(
+                    isPlaying = state.isPlaying,
+                    triggerCount = tapTriggerCount,
+                    modifier =
+                        Modifier
+                            .align(Alignment.BottomCenter)
+                            .height(0.dp)
+                            .wrapContentHeight(Alignment.Top, unbounded = true),
                 )
             }
 
-            // Center Play/Pause Transient Animated Overlay (disappears after a moment)
-            PlayPauseTransientOverlay(
-                isPlaying = state.isPlaying,
-                triggerCount = tapTriggerCount,
-                modifier = Modifier.align(Alignment.Center),
-            )
-
-            // Remaining time, in place of the old animated progress bar (no motion, no drag-seek —
-            // seeking stays available via the left/right ±10s tap zones).
+            // Remaining time, in place of the old animated progress bar (no motion, no drag-seek;
+            // there is no seeking within a track).
             RemainingTimeLabel(
                 positionMs = playbackManager.positionMs,
                 durationMs = state.durationMs,
+                onClick = {
+                    Log.d("TapPlayGesture", "open queue via time tap")
+                    scope.launch {
+                        if (!sheetState.isVisible) sheetState.show()
+                    }
+                },
                 modifier =
                     Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 48.dp),
+                        .navigationBarsPadding()
+                        // Text center = nav inset + QueueChevronCenterFromBottom (same as the sheet's chevron).
+                        // Needs QueueChevronCenterFromBottom >= TimeTouchHeight / 2 (28dp >= 24dp today).
+                        .padding(bottom = (QueueChevronCenterFromBottom - TimeTouchHeight / 2).coerceAtLeast(0.dp)),
             )
 
             // Full-screen volume wash while dragging; fades out once the finger lifts.
@@ -386,19 +415,15 @@ private fun handleGesture(
 ) {
     when (action) {
         is GestureAction.Tap ->
-            when (action.zone) {
-                GestureZone.CENTER -> onCenterTap()
-                GestureZone.LEFT -> playbackManager.seekBy(-SEEK_STEP_MS)
-                GestureZone.RIGHT -> playbackManager.seekBy(SEEK_STEP_MS)
-            }
+            // Side single taps do nothing: the side zones only act on double tap (prev/next).
+            if (action.zone == GestureZone.CENTER) onCenterTap()
         is GestureAction.DoubleTap ->
             when (action.zone) {
                 GestureZone.CENTER -> playbackManager.next()
                 GestureZone.LEFT -> playbackManager.previous()
                 GestureZone.RIGHT -> playbackManager.next()
             }
-        // LongPress is intentionally a no-op here: queue-open moved to a hold
-        // gesture on the artist text inside SongInfo (hold-glow).
+        // LongPress is intentionally a no-op here: the queue opens from a tap on the time label.
         is GestureAction.LongPress -> Unit
         is GestureAction.HorizontalSwipe ->
             when (action.direction) {
@@ -422,13 +447,33 @@ private fun handleGesture(
 private fun RemainingTimeLabel(
     positionMs: StateFlow<Long>,
     durationMs: Long,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val position by positionMs.collectAsStateWithLifecycle()
-    Text(
-        text = formatDuration((durationMs - position).coerceAtLeast(0L)),
-        color = Color.White.copy(alpha = 0.35f),
-        fontSize = 13.sp,
-        modifier = modifier,
-    )
+    // Tap zone: consumes its own down/up so the ambient detector resolves nothing from here
+    // (no play/pause, next/prev or volume). Key Unit: stable across recompositions.
+    val currentOnClick by rememberUpdatedState(onClick)
+    Box(
+        modifier =
+            modifier
+                .size(width = 120.dp, height = TimeTouchHeight)
+                // Accessibility: TalkBack double-tap runs only this semantic action (not the pointer
+                // path), so onClick fires once per activation.
+                .semantics(mergeDescendants = true) {
+                    role = Role.Button
+                    onClick(label = "Abrir cola") {
+                        currentOnClick()
+                        true
+                    }
+                }
+                .pointerInput(Unit) { detectTapGestures { currentOnClick() } },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = formatDuration((durationMs - position).coerceAtLeast(0L)),
+            color = Color.White.copy(alpha = 0.35f),
+            fontSize = 13.sp,
+        )
+    }
 }

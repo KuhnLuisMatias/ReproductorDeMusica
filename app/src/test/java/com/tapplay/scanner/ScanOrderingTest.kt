@@ -87,3 +87,42 @@ class ScanOrderingTest {
         assertEquals(emptyList<Item>(), ScanOrdering.groupOrdered(emptyList<Item>(), { it.folder }, { it.name }))
     }
 }
+
+class ScanOrderingEquivalenceTest {
+    private data class Item(val folder: String, val name: String, val id: Int)
+
+    private val oldOrder: (List<Item>) -> List<Item> = { items ->
+        items.sortedWith(compareBy({ it.folder.lowercase() }, { it.name.lowercase() }))
+    }
+
+    private val sample =
+        listOf(
+            Item("", "Zeta.mp3", 0), Item("", "álbum.mp3", 1), Item("", "Alfa.mp3", 2),
+            Item("", "alfa.mp3", 3), Item("", "ALFA.mp3", 4), Item("", "10 - x.mp3", 5),
+            Item("", "2 - x.mp3", 6), Item("", "😀 song.mp3", 7), Item("", "a😀.mp3", 8),
+            Item("Ñandú", "b.mp3", 9), Item("ñandú", "a.mp3", 10), Item("Rock/Live", "a\nb.mp3", 11),
+            Item("rock", "z.mp3", 12), Item("", "sin_extension", 13), Item("", "", 14),
+            Item("", "Alfa.mp3", 15), Item("Rock/Live", "A.mp3", 16), Item("ROCK/live", "a.mp3", 17),
+        )
+
+    @Test
+    fun `precomputed keys give exactly the same order as the old comparator`() {
+        val new = ScanOrdering.groupOrdered(sample, { it.folder }, { it.name })
+        assertEquals(oldOrder(sample).map { it.id }, new.map { it.id })
+        val shuffled = sample.reversed()
+        assertEquals(
+            oldOrder(shuffled).map { it.id },
+            ScanOrdering.groupOrdered(shuffled, { it.folder }, { it.name }).map { it.id },
+        )
+    }
+
+    @Test
+    fun `name and folder are read at most once per item`() {
+        val reads = IntArray(sample.size)
+        ScanOrdering.groupOrdered(sample, { it.folder }, {
+            reads[it.id]++
+            it.name
+        })
+        assertEquals(true, reads.all { it <= 1 })
+    }
+}

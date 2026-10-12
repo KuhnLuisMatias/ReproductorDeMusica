@@ -30,6 +30,7 @@ sealed interface GestureAction {
 
     data class DoubleTap(val zone: GestureZone) : GestureAction
 
+    // TODO: [TECH-DEBT] - GestureAction.LongPress ya no tiene consumidor (se descarta en PlayerScreen) - eliminar la detección de long press y el enum cuando se retire
     data class LongPress(val zone: GestureZone) : GestureAction
 
     data class HorizontalSwipe(val direction: SwipeDirection) : GestureAction

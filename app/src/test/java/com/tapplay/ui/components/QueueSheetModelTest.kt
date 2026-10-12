@@ -1,6 +1,7 @@
 package com.tapplay.ui.components
 
 import com.tapplay.model.Song
+import com.tapplay.player.SortMode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -307,6 +308,36 @@ class QueueSheetModelTest {
     }
 
     @Test
+    fun `artistSuggestionsFor puts the current artist first even with a blank query`() {
+        assertEquals(
+            listOf("B", "A", "C"),
+            artistSuggestionsFor(listOf("A", "B", "C"), "", currentArtist = "B"),
+        )
+    }
+
+    @Test
+    fun `artistSuggestionsFor puts a matching current artist first ignoring case and skips a non-matching one`() {
+        val artists = listOf("Alfa", "Gamma", "Beta", "Zeta")
+
+        assertEquals(
+            listOf("Beta", "Alfa", "Gamma", "Zeta"),
+            artistSuggestionsFor(artists, "a", currentArtist = "bETA"),
+        )
+        assertEquals(
+            listOf("Alfa", "Gamma"),
+            artistSuggestionsFor(listOf("Alfa", "Gamma", "Xyz"), "a", currentArtist = "Xyz"),
+        )
+    }
+
+    @Test
+    fun `artistSuggestionsFor without current artist keeps previous behavior`() {
+        val artists = listOf("Gonzalo", "Gonzalo", "Gonzalo Jr", "Gonzalo III")
+
+        assertEquals(artistSuggestionsFor(artists, "gonzalo"), artistSuggestionsFor(artists, "gonzalo", currentArtist = null))
+        assertEquals(listOf("Gonzalo Jr"), artistSuggestionsFor(artists, "Gonzalo", currentArtist = null).take(1))
+    }
+
+    @Test
     fun `scrollbarDragToIndex clamps to the reachable scroll range`() {
         assertEquals(0, scrollbarDragToIndex(dragY = -100f, totalItems = 50, visibleItems = 5, viewportPx = 1000f, minThumbPx = 32f))
         // 45 = totalItems - visibleItems: the last index that still shows a full page (D0.9 scrollbarThumb convention).
@@ -384,6 +415,47 @@ class QueueSheetModelTest {
 
         assertNull(anchorIndex(rows, "content://tree/unknown"))
         assertNull(anchorIndex(rows, null))
+    }
+
+    // ---- S12: scroll save/restore around the artist filter ----
+
+    @Test
+    fun `shouldSaveScroll saves when entering the filter`() {
+        assertTrue(shouldSaveScroll("", "beatles"))
+    }
+
+    @Test
+    fun `shouldSaveScroll does not re-save when changing from one filter to another`() {
+        assertFalse(shouldSaveScroll("beatles", "stones"))
+    }
+
+    @Test
+    fun `shouldSaveScroll does not save when leaving and treats blank as empty`() {
+        assertFalse(shouldSaveScroll("beatles", ""))
+        assertTrue(shouldSaveScroll("  ", "x"))
+    }
+
+    @Test
+    fun `scrollRestoreTarget follows the uri to its current index and keeps the offset`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L), song("c", 0L), song("d", 0L)), currentIndex = 0)
+
+        val target = scrollRestoreTarget(rows, SavedScroll("content://tree/c", index = 0, offset = 42))
+
+        assertEquals(Pair(2, 42), target)
+    }
+
+    @Test
+    fun `scrollRestoreTarget falls back to the clamped saved index and clamps a negative offset`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 0)
+
+        val target = scrollRestoreTarget(rows, SavedScroll("content://tree/gone", index = 9, offset = -5))
+
+        assertEquals(Pair(1, 0), target)
+    }
+
+    @Test
+    fun `scrollRestoreTarget returns null for an empty list`() {
+        assertNull(scrollRestoreTarget(emptyList(), SavedScroll("content://tree/a", index = 0, offset = 0)))
     }
 
     // ---- pushRecentSearch: capped, deduped, newest-first (C3) ----
@@ -556,5 +628,90 @@ class QueueSheetModelTest {
     @Test
     fun `searchTrailingAction shows the broom when text is present but unfocused`() {
         assertEquals(SearchTrailing.BROOM, searchTrailingAction("beatles", isFocused = false))
+    }
+
+    // ---- searchImeOutcome: IME Search decision (S9) ----
+
+    @Test
+    fun `searchImeOutcome hides the keyboard with an empty query`() {
+        assertEquals(SearchImeOutcome.HIDE_KEYBOARD, searchImeOutcome(""))
+    }
+
+    @Test
+    fun `searchImeOutcome hides the keyboard with a whitespace-only query`() {
+        assertEquals(SearchImeOutcome.HIDE_KEYBOARD, searchImeOutcome("   "))
+    }
+
+    @Test
+    fun `searchImeOutcome commits the search when there is text`() {
+        assertEquals(SearchImeOutcome.COMMIT, searchImeOutcome("beatles"))
+    }
+
+    // ---- swipeFadeAlpha / swipeRedAlpha: queue row swipe feedback (S11) ----
+
+    @Test
+    fun `swipeFadeAlpha is opaque at rest`() {
+        assertEquals(1f, swipeFadeAlpha(0f), 0.0001f)
+    }
+
+    @Test
+    fun `swipeFadeAlpha reaches the minimum at the threshold`() {
+        assertEquals(SWIPE_FADE_MIN_ALPHA, swipeFadeAlpha(SWIPE_FADE_END_PROGRESS), 0.0001f)
+    }
+
+    @Test
+    fun `swipeFadeAlpha is clamped outside the range`() {
+        assertEquals(SWIPE_FADE_MIN_ALPHA, swipeFadeAlpha(1f), 0.0001f)
+        assertEquals(1f, swipeFadeAlpha(-0.2f), 0.0001f)
+    }
+
+    @Test
+    fun `swipeFadeAlpha decreases as progress grows`() {
+        assertTrue(swipeFadeAlpha(0.1f) > swipeFadeAlpha(0.3f))
+    }
+
+    @Test
+    fun `swipeRedAlpha is transparent at rest`() {
+        assertEquals(0f, swipeRedAlpha(0f), 0.0001f)
+    }
+
+    @Test
+    fun `swipeRedAlpha is full at the threshold`() {
+        assertEquals(1f, swipeRedAlpha(SWIPE_FADE_END_PROGRESS), 0.0001f)
+    }
+
+    @Test
+    fun `swipeRedAlpha is clamped and NaN-safe`() {
+        assertEquals(1f, swipeRedAlpha(1f), 0.0001f)
+        assertEquals(0f, swipeRedAlpha(-0.2f), 0.0001f)
+        assertEquals(0f, swipeRedAlpha(Float.NaN), 0.0001f)
+    }
+
+    @Test
+    fun `swipeRedAlpha increases as progress grows`() {
+        assertTrue(swipeRedAlpha(0.1f) < swipeRedAlpha(0.3f))
+    }
+
+    @Test
+    fun `sortMenuAction on the active criterion toggles direction and keeps the menu open`() {
+        val action = sortMenuAction(SortMode.ARTIST, SortMode.ARTIST)
+        assertEquals(SortMenuAction.TOGGLE_DIRECTION, action)
+        assertFalse(action.closesMenu())
+    }
+
+    @Test
+    fun `sortMenuAction on another criterion selects it and closes the menu`() {
+        val action = sortMenuAction(SortMode.ARTIST, SortMode.DATE_ADDED)
+        assertEquals(SortMenuAction.SELECT_CRITERION, action)
+        assertTrue(action.closesMenu())
+    }
+
+    @Test
+    fun `sortMenuAction never closes on same mode and always closes on a different one`() {
+        for (current in SortMode.values()) {
+            for (tapped in SortMode.values()) {
+                assertEquals(current != tapped, sortMenuAction(current, tapped).closesMenu())
+            }
+        }
     }
 }

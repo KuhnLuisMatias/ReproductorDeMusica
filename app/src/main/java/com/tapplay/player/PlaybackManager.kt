@@ -4,6 +4,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.media.AudioManager
 import android.net.Uri
+import android.os.SystemClock
+import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -32,6 +34,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 class PlaybackManager(
@@ -46,6 +49,11 @@ class PlaybackManager(
     private var tickerJob: Job? = null
     private var positionPersistJob: Job? = null
     private var volumePersistJob: Job? = null
+    private var reorderJob: Job? = null
+
+    // Last sort actually applied: the rollback target when an optimistic reorder is aborted.
+    private var appliedSortMode: SortMode = SortMode.from(prefs.queueSortMode)
+    private var appliedSortDescending: Boolean = prefs.queueSortDescending
 
     // Filter state (spec: queue-filtered-playback R4) — manager-internal, NOT UI state (R16:
     // PlayerUiState unchanged, zero new StateFlow emissions). fullQueue is the single
@@ -160,19 +168,6 @@ class PlaybackManager(
         // play/pause transient overlay) read uiState synchronously right after this
         // call — without this, they'd render the PRE-toggle icon for one frame.
         _uiState.update { it.copy(isPlaying = willPlay) }
-    }
-
-    fun seekTo(positionMs: Long) {
-        controller?.seekTo(positionMs)
-        updateState()
-    }
-
-    /** Relative seek from the controller's live position (not the last UI tick), clamped to the track. */
-    fun seekBy(deltaMs: Long) {
-        val mediaController = controller ?: return
-        val duration = mediaController.duration
-        val target = (mediaController.currentPosition + deltaMs).coerceAtLeast(0L)
-        seekTo(if (duration != C.TIME_UNSET) target.coerceAtMost(duration) else target)
     }
 
     /**
@@ -355,71 +350,181 @@ class PlaybackManager(
 
     /**
      * Reorders the live queue to [mode] keeping the current song playing at
-     * its position — surgically, with controller.moveMediaItem index moves
-     * instead of a timeline rebuild, so playback NEVER re-prepares (no dip).
-     * Persists the mode first; DATE_MODIFIED lazily fetches missing
-     * lastModified values once (one bounded pass, merged in memory and
-     * persisted into the metadata cache). No indicator during the fetch
-     * (design D0.9).
+     * its position, without re-preparing it (no dip). Sorting and MediaItem
+     * building run on Dispatchers.Default; the timeline is then rewritten on
+     * Main in two replaceMediaItems calls around the current item (never
+     * replaced) and the queue manager adopts the new list once. The sort
+     * mode/direction are published optimistically at the start (the arrow
+     * flips at once) and rolled back if the reorder is aborted. Only one
+     * reorder is in flight: a new request cancels the previous one (last
+     * tap wins). A result computed against a queue that changed meanwhile
+     * (drag/remove) is discarded and recomputed once.
+     * DATE_MODIFIED lazily fetches missing lastModified values once (one
+     * bounded pass, merged in memory and persisted into the metadata cache).
+     * No indicator during the fetch (design D0.9).
      * While filtered, operates on the captured full queue and re-swaps the
      * sorted subset via swapTimeline when the current song matches (self-heals
-     * holds; unchanged — re-prepare there is a pre-existing ceiling);
-     * otherwise stays holding.
+     * holds; re-prepare there is a pre-existing ceiling); otherwise stays
+     * holding.
      */
     suspend fun reorderQueue(
         mode: SortMode,
         descending: Boolean,
     ) {
-        val mediaController = controller ?: return
-        if (queueManager.currentQueue.isEmpty()) return
+        if (controller == null || queueManager.currentQueue.isEmpty()) return
+        reorderJob?.cancel()
+        val job = scope.launch { runReorder(mode, descending) }
+        reorderJob = job
+        job.join()
+    }
 
+    private suspend fun runReorder(
+        mode: SortMode,
+        descending: Boolean,
+    ) {
+        val tTotal = SystemClock.elapsedRealtime()
         prefs.queueSortMode = mode.name
         prefs.queueSortDescending = descending
-
-        val wasFiltered = fullQueue != null // NOT activeQuery: BROWSING re-sorts the full queue in place (T15, D2)
-        val base = fullQueue ?: queueManager.currentQueue
-        var songs = base
-        if (mode == SortMode.DATE_MODIFIED && songs.any { it.lastModified == null }) {
-            val missing = songs.filter { it.lastModified == null }.map { it.uri }
-            val fetched = MusicScanner.fetchLastModified(context, missing)
-            songs = songs.map { song -> fetched[song.uri]?.let { song.copy(lastModified = it) } ?: song }
-            // Queue always corresponds to prefs.lastFolderUri (set at folder pick;
-            // restore rescans it). Null → skip persist; in-memory sort still works.
-            prefs.lastFolderUri?.let { folderUri ->
-                metadataCache.write(folderUri, MetadataCacheCodec.encode(songs.map { it.toCachedTrack() }))
-            }
-        }
-
-        val sorted = SortMode.apply(songs, mode, descending)
-        fullQueue = if (wasFiltered) sorted else null
-        persistQueueSnapshot(sorted) // always the FULL list (base was full or the captured full queue) — R10
-        if (!wasFiltered) {
-            // Surgical in-place reorder: plan the moves that transform the live
-            // timeline into `sorted`, then execute them one by one. No
-            // setMediaItems, no seekTo, no currentPath/positionMs capture — the
-            // playing item is never re-prepared, so playback is continuous
-            // (when the current item itself moves, Media3 only shifts
-            // currentIndex to follow it — same semantics as moveQueueItem).
-            val moves = surgicalMoves(
-                current = queueManager.currentQueue.map { it.uri },
-                sorted = sorted.map { it.uri },
-            )
-            for ((from, to) in moves) {
-                mediaController.moveMediaItem(from, to)
-                queueManager.moveItem(from, to) // mirror per-move (moveQueueItem precedent L427–428)
-            }
-        } else {
-            val currentPath = _uiState.value.currentSong?.path
-            val subset = sorted.filter { it.matchesQuery(activeQuery) }
-            val indexInSubset = subset.indexOfFirst { it.path == currentPath } // sign matters: absence = hold (D4)
-            if (indexInSubset >= 0) {
-                val positionMs = mediaController.currentPosition // MUST be read BEFORE setMediaItems (reads 0 after)
-                swapTimeline(subset, indexInSubset, positionMs) // seamless re-sort, self-heals holds (T16)
-            }
-            // else: stay holding — timeline (old subset) untouched, audio unaffected (T17/R15 ceiling)
-        }
         _uiState.update { it.copy(queueSortMode = mode, queueSortDescending = descending) }
-        updateState()
+        try {
+            // applied* are set inside applyReorder right after adopting (before any suspension)
+            if (!applyReorder(mode, descending, tTotal)) rollbackSort()
+        } catch (e: CancellationException) {
+            throw e // superseded by a newer request, which owns the sort state now
+        } catch (e: Exception) {
+            Log.e("QueueReorder", "reorder failed: ${e.javaClass.simpleName}")
+            rollbackSort()
+        }
+    }
+
+    private fun rollbackSort() {
+        prefs.queueSortMode = appliedSortMode.name
+        prefs.queueSortDescending = appliedSortDescending
+        _uiState.update { it.copy(queueSortMode = appliedSortMode, queueSortDescending = appliedSortDescending) }
+    }
+
+    /** True when the new order was applied (or intentionally held); false = aborted, nothing touched. */
+    private suspend fun applyReorder(
+        mode: SortMode,
+        descending: Boolean,
+        tTotal: Long,
+    ): Boolean {
+        for (attempt in 1..MAX_REORDER_ATTEMPTS) {
+            val mediaController = controller ?: return false
+            val wasFiltered = fullQueue != null // NOT activeQuery: BROWSING re-sorts the full queue in place (T15, D2)
+            val queueRef = queueManager.currentQueue
+            val fullRef = fullQueue
+            val queryAtStart = activeQuery
+            val base = fullRef ?: queueRef
+            if (base.isEmpty()) return false
+            var songs = base
+            if (mode == SortMode.DATE_MODIFIED && songs.any { it.lastModified == null }) {
+                val missing = songs.filter { it.lastModified == null }.map { it.uri }
+                val fetched = MusicScanner.fetchLastModified(context, missing)
+                songs = songs.map { song -> fetched[song.uri]?.let { song.copy(lastModified = it) } ?: song }
+                // Queue always corresponds to prefs.lastFolderUri (set at folder pick;
+                // restore rescans it). Null → skip persist; in-memory sort still works.
+                prefs.lastFolderUri?.let { folderUri ->
+                    metadataCache.write(folderUri, MetadataCacheCodec.encode(songs.map { it.toCachedTrack() }))
+                }
+            }
+
+            val tSort = SystemClock.elapsedRealtime()
+            val (sorted, items) =
+                withContext(Dispatchers.Default) {
+                    val ordered = SortMode.apply(songs, mode, descending)
+                    ordered to if (wasFiltered) emptyList() else toMediaItems(ordered)
+                }
+            val sortMs = SystemClock.elapsedRealtime() - tSort
+
+            // Back on Main with no suspension until the end of the apply: atomic.
+            val stale =
+                isStaleReorder(
+                    capturedController = mediaController,
+                    currentController = controller,
+                    queueRef = queueRef,
+                    currentQueue = queueManager.currentQueue,
+                    fullRef = fullRef,
+                    currentFull = fullQueue,
+                    queryAtStart = queryAtStart,
+                    activeQuery = activeQuery,
+                )
+            if (stale) {
+                Log.w("QueueReorder", "controller or queue changed while sorting, discarded attempt=$attempt")
+                continue
+            }
+            val tApply = SystemClock.elapsedRealtime()
+            if (!wasFiltered) {
+                if (!applyAroundCurrent(mediaController, sorted, items)) {
+                    Log.w("QueueReorder", "current song not found in the queue, aborted")
+                    return false
+                }
+            } else {
+                fullQueue = sorted
+                val currentPath = _uiState.value.currentSong?.path
+                val subset = sorted.filter { it.matchesQuery(activeQuery) }
+                val indexInSubset = subset.indexOfFirst { it.path == currentPath } // sign matters: absence = hold (D4)
+                if (indexInSubset >= 0) {
+                    val positionMs = mediaController.currentPosition // MUST be read BEFORE setMediaItems (reads 0 after)
+                    swapTimeline(subset, indexInSubset, positionMs) // seamless re-sort, self-heals holds (T16)
+                }
+                // else: stay holding — timeline (old subset) untouched, audio unaffected (T17/R15 ceiling)
+            }
+            updateState()
+            // Right after adopting, before any suspension: a cancel during persist must not
+            // leave the arrow/prefs out of step with the order really applied.
+            appliedSortMode = mode
+            appliedSortDescending = descending
+            val applyMs = SystemClock.elapsedRealtime() - tApply
+
+            val tPersist = SystemClock.elapsedRealtime()
+            // always the FULL list (base was full or the captured full queue) — R10; encoded off Main,
+            // written back on Main only if no newer persist (remove/move/setQueue) superseded it.
+            val folderUri = prefs.lastFolderUri
+            if (folderUri != null) {
+                val encoded =
+                    withContext(Dispatchers.Default) { encodeQueueSnapshot(folderUri, sorted) }
+                val live = fullQueue ?: queueManager.currentQueue
+                if (shouldWriteSnapshot(live, sorted) && prefs.lastFolderUri == folderUri) {
+                    prefs.queueSnapshot = encoded
+                } else {
+                    Log.w("QueueReorder", "snapshot write discarded, queue changed while encoding")
+                }
+            }
+            Log.d(
+                "QueueReorder",
+                "reorder n=${sorted.size} sortMs=$sortMs applyMs=$applyMs " +
+                    "persistMs=${SystemClock.elapsedRealtime() - tPersist} " +
+                    "totalMs=${SystemClock.elapsedRealtime() - tTotal}",
+            )
+            return true
+        }
+        Log.w("QueueReorder", "queue kept changing, gave up after $MAX_REORDER_ATTEMPTS attempts")
+        return false
+    }
+
+    /**
+     * Rewrites the timeline to [sorted] with two replaceMediaItems calls that
+     * leave the playing item untouched (never re-prepared), then adopts the
+     * list once. False (nothing touched) when the playing song is not in it.
+     */
+    private fun applyAroundCurrent(
+        mediaController: MediaController,
+        sorted: List<Song>,
+        items: List<MediaItem>,
+    ): Boolean {
+        val curIdx = mediaController.currentMediaItemIndex
+        val curUri = queueManager.currentQueue.getOrNull(curIdx)?.uri ?: return false
+        val (before, after) = splitAroundCurrent(sorted.map { it.uri }, curUri) ?: return false
+        val count = mediaController.mediaItemCount
+        if (count > curIdx + 1 || !after.isEmpty()) {
+            mediaController.replaceMediaItems(curIdx + 1, count, items.slice(after))
+        }
+        if (curIdx > 0 || !before.isEmpty()) {
+            mediaController.replaceMediaItems(0, curIdx, items.slice(before))
+        }
+        queueManager.adopt(sorted)
+        return true
     }
 
     /**
@@ -531,9 +636,13 @@ class PlaybackManager(
     /** Persists the queue snapshot for instant cold-start restore (no-op without a folder). */
     private fun persistQueueSnapshot(songs: List<Song>) {
         val folderUri = prefs.lastFolderUri ?: return
-        prefs.queueSnapshot =
-            QueueSnapshotCodec.encode(QueueSnapshot(folderUri, songs.map { it.toCachedTrack() }))
+        prefs.queueSnapshot = encodeQueueSnapshot(folderUri, songs)
     }
+
+    private fun encodeQueueSnapshot(
+        folderUri: String,
+        songs: List<Song>,
+    ): String = QueueSnapshotCodec.encode(QueueSnapshot(folderUri, songs.map { it.toCachedTrack() }))
 
     private fun persistPosition() {
         prefs.positionMs = controller?.currentPosition ?: _positionMs.value
@@ -581,5 +690,6 @@ class PlaybackManager(
         const val VOLUME_PERSIST_DEBOUNCE_MS = 500L
         const val CONTROLLER_POLL_MS = 50L
         const val CONTROLLER_WAIT_TIMEOUT_MS = 5_000L
+        const val MAX_REORDER_ATTEMPTS = 2
     }
 }

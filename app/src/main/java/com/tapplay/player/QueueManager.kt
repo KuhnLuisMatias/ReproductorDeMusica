@@ -15,7 +15,15 @@ class QueueManager {
      */
     fun buildMediaItems(songs: List<Song>): List<MediaItem> {
         currentQueue = songs
-        return songs.map { song -> song.toMediaItem() }
+        return toMediaItems(songs)
+    }
+
+    /**
+     * Adopts [sorted] as the new queue in one assignment (the controller
+     * timeline was already rewritten to the same order). Main thread only.
+     */
+    fun adopt(sorted: List<Song>) {
+        currentQueue = sorted
     }
 
     /**
@@ -43,19 +51,6 @@ class QueueManager {
         val mutable = currentQueue.toMutableList()
         mutable.removeAt(index)
         currentQueue = mutable
-    }
-
-    private fun Song.toMediaItem(): MediaItem {
-        val metadata =
-            MediaMetadata.Builder()
-                .setTitle(title)
-                .setArtist(artist)
-                .setAlbumTitle(album)
-                .build()
-        return MediaItem.Builder()
-            .setUri(uri)
-            .setMediaMetadata(metadata)
-            .build()
     }
 }
 
@@ -104,48 +99,58 @@ fun engagementIndex(
 }
 
 /**
- * Plans the timeline edits transforming [current] into [sorted] as a sequence
- * of index moves (remove-then-insert — same semantics as QueueManager.moveItem
- * and MediaController.moveMediaItem).
- *
- * Greedy index repair: for each target position i, find where sorted[i]
- * currently sits in the evolving list and move it to i. One sweep suffices: a
- * fixed point invariant holds — after filling slot i, slots 0..i match sorted,
- * and sorted[i] can never be found in 0..i-1 (those slots hold earlier,
- * distinct values), so every search index satisfies j >= i and moves never
- * disturb filled slots. Indices inside the returned pairs are LIVE indices:
- * each (from, to) is valid in the list state AFTER all earlier moves were
- * applied, not in the original input.
- *
- * Precondition (same assumption the queue LazyColumn's `key = song.uri`
- * already makes, QueueSheet L602): [current] and [sorted] contain the same
- * songs with unique uris. Duplicate-uri behavior is out of contract.
- *
- * ponytail: greedy in O(n) moves worst case (n indexOf scans -> O(n^2) total).
- * Upgrade path: minimal-moves via LIS only if profiling ever shows jank on
- * huge queues.
+ * Ranges of [sortedUris] strictly before and strictly after the song playing
+ * ([currentUri]) in the new order; null when it is absent. Lets the timeline
+ * be rewritten in two replaceMediaItems calls around the current item, which
+ * is never replaced (so it is never re-prepared). Pure.
  */
-fun surgicalMoves(current: List<String>, sorted: List<String>): List<Pair<Int, Int>> {
-    val work = current.toMutableList()
-    val moves = mutableListOf<Pair<Int, Int>>()
-    for (i in sorted.indices) {
-        val j = work.indexOf(sorted[i])
-        if (j != i) {
-            moves += j to i
-            work.add(i, work.removeAt(j))
-        }
-    }
-    return moves
+fun splitAroundCurrent(
+    sortedUris: List<String>,
+    currentUri: String,
+): Pair<IntRange, IntRange>? {
+    val k = sortedUris.indexOf(currentUri)
+    if (k < 0) return null
+    return (0 until k) to (k + 1 until sortedUris.size)
 }
 
 /**
- * Applies surgicalMoves output: each pair is one remove-then-insert move on
- * the evolving list — the executable simulation of the controller + mirror
- * move pair (QueueManager.moveItem run in sequence). Pure; used by
- * QueueManagerTest to verify plans end-to-end.
+ * A snapshot encoded off Main may be written only while the queue it was built
+ * from is still the live one (same reference); otherwise a newer persist won. Pure.
  */
-fun applyMoves(current: List<String>, moves: List<Pair<Int, Int>>): List<String> {
-    val work = current.toMutableList()
-    for ((from, to) in moves) work.add(to, work.removeAt(from))
-    return work
+fun shouldWriteSnapshot(
+    liveQueue: List<Song>,
+    sorted: List<Song>,
+): Boolean = liveQueue === sorted
+
+/**
+ * True when a reorder computed off Main must be discarded: the controller, the
+ * queue/full-queue references or the query changed while suspended. Pure.
+ */
+fun isStaleReorder(
+    capturedController: Any,
+    currentController: Any?,
+    queueRef: List<Song>,
+    currentQueue: List<Song>,
+    fullRef: List<Song>?,
+    currentFull: List<Song>?,
+    queryAtStart: String,
+    activeQuery: String,
+): Boolean =
+    capturedController !== currentController || queueRef !== currentQueue ||
+        fullRef !== currentFull || queryAtStart != activeQuery
+
+/** Pure, thread-safe MediaItem construction (safe to run off the main thread). */
+fun toMediaItems(songs: List<Song>): List<MediaItem> = songs.map { it.toMediaItem() }
+
+private fun Song.toMediaItem(): MediaItem {
+    val metadata =
+        MediaMetadata.Builder()
+            .setTitle(title)
+            .setArtist(artist)
+            .setAlbumTitle(album)
+            .build()
+    return MediaItem.Builder()
+        .setUri(uri)
+        .setMediaMetadata(metadata)
+        .build()
 }

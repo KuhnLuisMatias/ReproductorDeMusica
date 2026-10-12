@@ -21,7 +21,7 @@ Reproductor de música offline ultra-minimalista para Android. Una pantalla. La 
 **Reproducción y gestos**
 
 - Reproducción local por carpetas vía SAF (`DocumentFile`), sin permisos de almacenamiento globales.
-- Player de una pantalla guiado por gestos: tap en zonas (seek ±10 s / play-pause), doble tap (anterior/siguiente), presión larga (reiniciar pista), swipes horizontales y arrastre vertical para el volumen (el dedo funciona como slider).
+- Player de una pantalla guiado por gestos: tap central (play/pausa), doble tap (anterior/siguiente), swipes horizontales y arrastre vertical para el volumen (el dedo funciona como slider).
 - Servicio de reproducción con `MediaSession`: notificación del sistema, restauración de sesión en pausa y volumen persistente.
 - Interfaz de texto puro sobre negro: tipografía JetBrains Mono variable, artista como protagonista (46sp), modos claros de fallback determinista derivados del nombre de archivo.
 
@@ -73,10 +73,10 @@ El APK se genera en `app/build/outputs/apk/debug/`.
 ## Uso
 
 1. Abrir la app y elegir la carpeta donde está la música (acceso vía SAF, sin permisos globales).
-2. Tap en zonas laterales: seek ±10 s. Tap central: play/pausa.
-3. Doble tap: pista anterior/siguiente. Presión larga: reiniciar la pista.
+2. Tap central: play/pausa.
+3. Doble tap: pista anterior/siguiente. Tap en el tiempo restante (al pie de la pantalla): abre la cola.
 4. Arrastre vertical: volumen (el dedo es el slider). Swipes horizontales: navegación.
-5. Tap en la cabecera: cola con búsqueda, orden y reordenamiento por arrastre.
+5. La cola ofrece búsqueda, orden y reordenamiento por arrastre.
 
 ## Roadmap
 

@@ -1,5 +1,7 @@
 package com.tapplay.ui.components
 
+import android.util.Log
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -10,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -41,6 +44,7 @@ import androidx.compose.material.LocalTextStyle
 import androidx.compose.foundation.Canvas
 import androidx.compose.material.Text
 import androidx.compose.material.DismissDirection
+import androidx.compose.material.DismissState
 import androidx.compose.material.DismissValue
 import androidx.compose.material.ExperimentalMaterialApi
 import androidx.compose.material.SwipeToDismiss
@@ -74,12 +78,16 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
@@ -94,6 +102,14 @@ import kotlin.math.roundToInt
 /** Queue sheet palette (spec: queue-view "Sheet visual palette"). */
 val QueueSheetBackground = Color.Black
 private val SeparatorColor = Color.White.copy(alpha = 0.08f)
+private val PinnedBarBorder = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f))
+private val SearchBarBrush =
+    Brush.verticalGradient(
+        listOf(
+            Color.White.copy(alpha = 0.08f),
+            Color.White.copy(alpha = 0.04f),
+        ),
+    )
 private val ScrollbarColor = Color.White.copy(alpha = 0.35f)
 private val ScrollbarWidth = 8.dp
 private val ScrollbarEndPadding = 6.dp
@@ -102,7 +118,14 @@ private val ScrollbarHitWidth = 28.dp
 private val ScrubPreviewHeight = 32.dp
 private val HeaderButtonSize = 40.dp
 private val SortLabelMaxWidth = 130.dp
+private val SearchBarHeight = 56.dp
+private val SearchTrailingSlot = 48.dp
 private const val ARTIST_SUGGESTION_LIMIT = 6
+
+/** Bottom minimize chevron geometry; shared so the main screen's time label can align to its center. */
+internal val QueueChevronPadding = 12.dp
+internal val QueueChevronIconSize = 32.dp
+internal val QueueChevronCenterFromBottom = QueueChevronPadding + QueueChevronIconSize / 2
 
 /** Immutable view model of one queue sheet row (pure, JVM-tested). */
 data class QueueRow(
@@ -198,6 +221,54 @@ fun searchTrailingAction(
         query.isNotBlank() -> SearchTrailing.BROOM
         else -> null
     }
+
+/** What the IME Search action does (S9). */
+enum class SearchImeOutcome { COMMIT, HIDE_KEYBOARD }
+
+/** Pure seam (JVM-tested): text -> commit the search; blank/empty -> just hide the keyboard. */
+fun searchImeOutcome(query: String): SearchImeOutcome {
+    return if (query.isNotBlank()) SearchImeOutcome.COMMIT else SearchImeOutcome.HIDE_KEYBOARD
+}
+
+/** Swipe-to-remove feedback (S11): content fades to this alpha and the red background is full at [SWIPE_FADE_END_PROGRESS]. */
+internal const val SWIPE_FADE_MIN_ALPHA = 0.15f
+internal const val SWIPE_FADE_END_PROGRESS = 0.5f
+
+/** Action for a tap on a sort menu item: pick a new criterion or flip the direction of the current one. */
+enum class SortMenuAction { SELECT_CRITERION, TOGGLE_DIRECTION }
+
+/** Pure (JVM-tested): tapping the already active [current] criterion toggles direction; any other selects it. */
+fun sortMenuAction(
+    current: SortMode,
+    tapped: SortMode,
+): SortMenuAction = if (tapped == current) SortMenuAction.TOGGLE_DIRECTION else SortMenuAction.SELECT_CRITERION
+
+/** Pure (JVM-tested): the menu closes only when a criterion is selected, not when toggling direction. */
+fun SortMenuAction.closesMenu(): Boolean = this == SortMenuAction.SELECT_CRITERION
+
+/** Pure (JVM-tested): row content alpha, 1f at rest down to [SWIPE_FADE_MIN_ALPHA] at the threshold. */
+internal fun swipeFadeAlpha(progress: Float): Float {
+    if (progress.isNaN()) return 1f
+    val t = (progress / SWIPE_FADE_END_PROGRESS).coerceIn(0f, 1f)
+    return 1f - t * (1f - SWIPE_FADE_MIN_ALPHA)
+}
+
+/** Pure (JVM-tested): red background alpha, 0f at rest up to 1f at the threshold. */
+internal fun swipeRedAlpha(progress: Float): Float {
+    if (progress.isNaN()) return 0f
+    return (progress / SWIPE_FADE_END_PROGRESS).coerceIn(0f, 1f)
+}
+
+/** Single source of the swipe progress (0..1 toward DismissedToStart) for both alphas. */
+@OptIn(ExperimentalMaterialApi::class)
+private fun swipeProgress(state: DismissState): Float {
+    val p = state.progress
+    return when {
+        p.from == p.to -> if (state.currentValue == DismissValue.DismissedToStart) 1f else 0f
+        p.to == DismissValue.DismissedToStart -> p.fraction
+        else -> 1f - p.fraction
+    }
+}
 
 /**
  * Pure drag math (JVM-tested, no Compose types): [centers] holds each visible
@@ -309,6 +380,32 @@ fun anchorIndex(
     return index.takeIf { it >= 0 }
 }
 
+/** Scroll position captured when entering the filter (S12): first visible row's uri, index and pixel offset. */
+data class SavedScroll(
+    val uri: String?,
+    val index: Int,
+    val offset: Int,
+)
+
+/** Pure (JVM-tested): save the scroll only when the query goes from blank to non-blank. */
+fun shouldSaveScroll(
+    previousQuery: String,
+    newQuery: String,
+): Boolean = previousQuery.isBlank() && newQuery.isNotBlank()
+
+/**
+ * Pure (JVM-tested): (index, offset) to restore after leaving the filter, or null for an empty list.
+ * Follows the saved uri; if it is gone, uses the saved index clamped to the list; offset never negative.
+ */
+fun scrollRestoreTarget(
+    rows: List<QueueRow>,
+    saved: SavedScroll,
+): Pair<Int, Int>? {
+    if (rows.isEmpty()) return null
+    val index = anchorIndex(rows, saved.uri) ?: saved.index.coerceIn(0, rows.lastIndex)
+    return Pair(index, saved.offset.coerceAtLeast(0))
+}
+
 private const val RECENT_SEARCHES_CAP = 5
 
 /**
@@ -331,21 +428,26 @@ fun pushRecentSearch(
 /**
  * Pure autocomplete (JVM-tested): distinct [artists] whose name contains
  * [query] (case-insensitive), excluding an exact match (already fully typed),
- * capped at [limit]. Blank query yields no suggestions.
+ * capped at [limit]. Blank query yields no suggestions, unless there is a
+ * [currentArtist]: then all artists are candidates. The [currentArtist]
+ * (case-insensitive) is moved to the front, before the cap, if it passes the filter.
  */
 fun artistSuggestionsFor(
     artists: List<String>,
     query: String,
     limit: Int = ARTIST_SUGGESTION_LIMIT,
-): List<String> =
-    if (query.isBlank()) {
-        emptyList()
-    } else {
+    currentArtist: String? = null,
+): List<String> {
+    if (query.isBlank() && currentArtist == null) return emptyList()
+    val matches =
         artists
-            .filter { it.contains(query, ignoreCase = true) && !it.equals(query, ignoreCase = true) }
-            .distinct()
-            .take(limit)
-    }
+            .filter {
+                query.isBlank() || (it.contains(query, ignoreCase = true) && !it.equals(query, ignoreCase = true))
+            }.distinct()
+    val current = currentArtist?.let { c -> matches.firstOrNull { it.equals(c, ignoreCase = true) } }
+    val ordered = if (current == null) matches else listOf(current) + matches.filter { it != current }
+    return ordered.take(limit)
+}
 
 /**
  * Pure inverse of [scrollbarThumb] (JVM-tested): maps a raw drag [dragY]
@@ -403,7 +505,7 @@ fun Modifier.queueScrollbar(
  * The sheet is capped at half the screen height and shows a scrollbar thumb
  * that communicates scroll position and relative list length.
  */
-@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterialApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterialApi::class, ExperimentalComposeUiApi::class)
 @Composable
 fun QueueSheetContent(
     rows: List<QueueRow>,
@@ -445,6 +547,7 @@ fun QueueSheetContent(
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
     var searchFocused by remember { mutableStateOf(false) }
+    val keyboardController = LocalSoftwareKeyboardController.current
     // Only recomputed when the queue or the query actually changes — not on every
     // scrub/scroll recomposition, which would otherwise re-filter the whole list per frame.
     val visibleRows = remember(rows, query) { filterRows(rows, query) }
@@ -458,11 +561,16 @@ fun QueueSheetContent(
     // non-blank keeps the capped, filtered suggestions from artistSuggestionsFor.
     // This wins the blank slot over the recents row below, which now only fires
     // when the queue has no artists at all.
-    val artistSuggestions =
-        remember(query, allArtists) {
-            if (query.isBlank()) allArtists else artistSuggestionsFor(allArtists, query)
-        }
     val currentArtist = remember(rows) { rows.firstOrNull { it.isCurrent }?.song?.artist }
+    val artistSuggestions =
+        remember(query, allArtists, currentArtist) {
+            if (query.isBlank()) {
+                artistSuggestionsFor(allArtists, query, limit = Int.MAX_VALUE, currentArtist = currentArtist)
+                    .ifEmpty { allArtists }
+            } else {
+                artistSuggestionsFor(allArtists, query, currentArtist = currentArtist)
+            }
+        }
 
     // R3.7 (user-flagged, behavior decision): with the current track pinned
     // to the bottom bar and the locate chip for on-demand jumps, opening the
@@ -484,6 +592,36 @@ fun QueueSheetContent(
         }
         listState.scrollToItem(anchorIndex(visibleRows, scrollAnchorUri) ?: 0)
         anchorRestored = true
+    }
+
+    // S12: single entry point for query changes. The scroll is captured BEFORE the
+    // new query is written (the filtered recomposition would already move the list).
+    var savedScroll by remember { mutableStateOf<SavedScroll?>(null) }
+
+    fun updateQuery(new: String) {
+        if (shouldSaveScroll(query, new)) {
+            val first = listState.firstVisibleItemIndex
+            savedScroll =
+                SavedScroll(
+                    uri = visibleRows.getOrNull(first)?.song?.uri,
+                    index = first,
+                    offset = listState.firstVisibleItemScrollOffset,
+                )
+            Log.d("QueueSheet", "filter scroll saved index=$first")
+        }
+        query = new
+        onQueryChanged(new)
+    }
+    LaunchedEffect(query.isBlank()) {
+        if (query.isBlank()) {
+            savedScroll?.let { saved ->
+                scrollRestoreTarget(visibleRows, saved)?.let { (index, offset) ->
+                    listState.scrollToItem(index, offset)
+                    Log.d("QueueSheet", "filter scroll restored index=$index")
+                }
+                savedScroll = null
+            }
+        }
     }
 
     fun locateCurrent() {
@@ -590,8 +728,7 @@ fun QueueSheetContent(
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color.White.copy(alpha = 0.1f))
                                 .clickable {
-                                    query = artist
-                                    onQueryChanged(artist)
+                                    updateQuery(artist)
                                     onCommitSearch(artist)
                                 }
                                 .padding(horizontal = 12.dp, vertical = 6.dp),
@@ -610,8 +747,7 @@ fun QueueSheetContent(
             BasicTextField(
                 value = query,
                 onValueChange = {
-                    query = it
-                    onQueryChanged(it)
+                    updateQuery(it)
                 },
                 singleLine = true,
                 textStyle =
@@ -624,73 +760,76 @@ fun QueueSheetContent(
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions =
                     KeyboardActions(onSearch = {
-                        if (query.isNotBlank()) onCommitSearch(query)
+                        val outcome = searchImeOutcome(query)
+                        Log.d("QueueSearch", "ime search outcome=$outcome")
+                        when (outcome) {
+                            SearchImeOutcome.COMMIT -> onCommitSearch(query)
+                            // Hide only; focus stays so the trailing control does not flip.
+                            SearchImeOutcome.HIDE_KEYBOARD -> keyboardController?.hide()
+                        }
                     }),
                 modifier =
                     Modifier
                         .onFocusChanged { searchFocused = it.isFocused }
+                        .height(SearchBarHeight)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(
-                            Brush.verticalGradient(
-                                listOf(
-                                    Color.White.copy(alpha = 0.08f),
-                                    Color.White.copy(alpha = 0.04f),
-                                ),
-                            ),
-                        )
+                        .background(SearchBarBrush)
                         .weight(1f),
                 decorationBox = { innerTextField ->
                     // Trailing action lives INSIDE the pill (trailing-icon pattern):
                     // the field keeps its full width, the icon stays within it.
                     val trailingAction = searchTrailingAction(query, searchFocused)
-                    // Pill height grows (~48 → ~60dp): vertical padding inflates it,
-                    // while the gradient background sits OUTSIDE decorationBox on the
-                    // BasicTextField modifier chain, so it still fills the full pill.
-                    Row(
-                        modifier = Modifier.padding(vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Box(
-                            modifier = Modifier.weight(1f),
-                            contentAlignment = Alignment.CenterStart,
-                        ) {
-                            if (query.isEmpty()) {
-                                Text(
-                                    text = "Buscar canción o artista",
-                                    color = Color.White.copy(alpha = 0.4f),
-                                    fontSize = 15.sp,
-                                )
-                            }
-                            innerTextField()
+                    // Fixed size (S8): the bar height comes from SearchBarHeight on the
+                    // modifier chain and the trailing slot is always reserved, so typing
+                    // never changes the bar's size. The placeholder is a full-width overlay
+                    // (stays centered in the bar, S4) and does not depend on the slot.
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        if (query.isEmpty()) {
+                            Text(
+                                text = "Buscar canción o artista",
+                                color = Color.White.copy(alpha = 0.4f),
+                                fontSize = 15.sp,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
                         }
-                        when (trailingAction) {
-                            SearchTrailing.CLOSE ->
-                                IconButton(
-                                    onClick = {
-                                        query = ""
-                                        onQueryChanged("")
-                                    },
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Close,
-                                        contentDescription = "Borrar texto escrito",
-                                        tint = Color.White,
-                                    )
+                        Row(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.CenterStart,
+                            ) {
+                                innerTextField()
+                            }
+                            Box(modifier = Modifier.size(SearchTrailingSlot), contentAlignment = Alignment.Center) {
+                                when (trailingAction) {
+                                    SearchTrailing.CLOSE ->
+                                        IconButton(
+                                            onClick = { updateQuery("") },
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Close,
+                                                contentDescription = "Borrar texto escrito",
+                                                tint = Color.White,
+                                            )
+                                        }
+                                    SearchTrailing.BROOM ->
+                                        IconButton(
+                                            onClick = { updateQuery("") },
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Delete,
+                                                contentDescription = "Limpiar búsqueda",
+                                                tint = Color.White,
+                                            )
+                                        }
+                                    null -> {}
                                 }
-                            SearchTrailing.BROOM ->
-                                IconButton(
-                                    onClick = {
-                                        query = ""
-                                        onQueryChanged("")
-                                    },
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Delete,
-                                        contentDescription = "Limpiar búsqueda",
-                                        tint = Color.White,
-                                    )
-                                }
-                            null -> {}
+                            }
                         }
                     }
                 },
@@ -717,8 +856,7 @@ fun QueueSheetContent(
                                     .clip(RoundedCornerShape(14.dp))
                                     .background(accent.copy(alpha = 0.18f))
                                     .clickable {
-                                        query = currentArtist
-                                        onQueryChanged(currentArtist)
+                                        updateQuery(currentArtist)
                                         onCommitSearch(currentArtist)
                                     }
                                     .padding(horizontal = 12.dp, vertical = 6.dp),
@@ -737,8 +875,7 @@ fun QueueSheetContent(
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color.White.copy(alpha = 0.1f))
                                 .clickable {
-                                    query = recent
-                                    onQueryChanged(recent)
+                                    updateQuery(recent)
                                     onCommitSearch(recent)
                                 }
                                 .padding(horizontal = 12.dp, vertical = 6.dp),
@@ -752,6 +889,7 @@ fun QueueSheetContent(
             onSortSelected = onSortSelected,
             onToggleDirection = onToggleDirection,
             onPickFolder = {
+                savedScroll = null
                 onQueryChanged("")
                 query = ""
                 onPickFolder()
@@ -818,6 +956,7 @@ fun QueueSheetContent(
                     val dismissState = rememberDismissState(
                         confirmStateChange = { dismissValue ->
                             if (dismissValue == DismissValue.DismissedToStart) {
+                                Log.d("QueueSheet", "row removed by swipe")
                                 onRemoveRow(row.index)
                                 true
                             } else {
@@ -829,33 +968,32 @@ fun QueueSheetContent(
                         state = dismissState,
                         directions = setOf(DismissDirection.EndToStart),
                         background = {
-                            val isDismissing = dismissState.dismissDirection == DismissDirection.EndToStart
                             Box(
                                 modifier = Modifier
+                                    .graphicsLayer { alpha = swipeRedAlpha(swipeProgress(dismissState)) }
                                     .fillMaxSize()
-                                    .background(if (isDismissing) Color(0xFFE53935) else Color.Transparent)
-                                    .padding(horizontal = 20.dp),
+                                    .background(Color(0xFFE53935))
+                                    .padding(horizontal = 20.dp)
+                                    .clearAndSetSemantics {},
                                 contentAlignment = Alignment.CenterEnd
                             ) {
-                                if (isDismissing) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.End
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Filled.Delete,
-                                            contentDescription = "Remover",
-                                            tint = Color.White,
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(
-                                            text = "REMOVER",
-                                            color = Color.White,
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 14.sp
-                                        )
-                                    }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.End
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Delete,
+                                        contentDescription = null,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "REMOVER",
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 14.sp
+                                    )
                                 }
                             }
                         },
@@ -869,6 +1007,9 @@ fun QueueSheetContent(
                                 onTogglePlayPause = onTogglePlayPause,
                                 modifier =
                                     Modifier
+                                        // Cancel SwipeToDismiss's own offset (same layout phase): the row stays still.
+                                        .offset { IntOffset(-dismissState.offset.value.roundToInt(), 0) }
+                                        .graphicsLayer { alpha = swipeFadeAlpha(swipeProgress(dismissState)) }
                                         .zIndex(if (row.song.uri == draggingUri) 1f else 0f)
                                         .graphicsLayer {
                                             translationY =
@@ -1009,14 +1150,14 @@ fun QueueSheetContent(
                 .fillMaxWidth()
                 .clickable { onClose() }
                 .navigationBarsPadding()
-                .padding(vertical = 12.dp),
+                .padding(vertical = QueueChevronPadding),
             contentAlignment = Alignment.Center,
         ) {
             Icon(
                 imageVector = Icons.Filled.KeyboardArrowDown,
                 contentDescription = "Minimizar cola",
                 tint = Color.White,
-                modifier = Modifier.size(32.dp),
+                modifier = Modifier.size(QueueChevronIconSize),
             )
         }
     }
@@ -1087,37 +1228,30 @@ private fun SortHeader(
                 SortMode.values().forEach { mode ->
                     DropdownMenuItem(
                         onClick = {
-                            expanded = false
-                            // Same-mode text-tap: close-noop — reorderQueue with
-                            // identical args would be a pure-waste re-apply.
-                            if (mode != sortMode) onSortSelected(mode)
+                            // Active criterion (arrow or anywhere on its row): flip direction,
+                            // menu stays open. Another criterion: apply it and close.
+                            val action = sortMenuAction(sortMode, mode)
+                            if (action.closesMenu()) expanded = false
+                            when (action) {
+                                SortMenuAction.SELECT_CRITERION -> onSortSelected(mode)
+                                SortMenuAction.TOGGLE_DIRECTION -> onToggleDirection()
+                            }
                         },
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(modifier = Modifier.width(40.dp), contentAlignment = Alignment.CenterStart) {
                                 if (mode == sortMode) {
-                                    // Arrow tap flips direction IN PLACE: does NOT set
-                                    // expanded=false → M2 menu stays open; reorderQueue
-                                    // with flipped direction re-runs → arrow + list
-                                    // flip live.
-                                    Box(
-                                        modifier =
-                                            Modifier
-                                                .size(40.dp)
-                                                .clickable { onToggleDirection() },
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Icon(
-                                            imageVector =
-                                                if (descending) {
-                                                    Icons.Filled.KeyboardArrowDown
-                                                } else {
-                                                    Icons.Filled.KeyboardArrowUp
-                                                },
-                                            contentDescription = "Invertir sentido",
-                                            tint = Color.White,
-                                        )
-                                    }
+                                    // Indicator only: the whole row handles the tap.
+                                    Icon(
+                                        imageVector =
+                                            if (descending) {
+                                                Icons.Filled.KeyboardArrowDown
+                                            } else {
+                                                Icons.Filled.KeyboardArrowUp
+                                            },
+                                        contentDescription = "Invertir sentido",
+                                        tint = Color.White,
+                                    )
                                 }
                                 // non-selected rows: empty Box, no Check (alignment parity)
                             }
@@ -1172,10 +1306,11 @@ private fun QueueRowItem(
                 .fillMaxWidth()
                 .background(rowBackground)
                 .clickable { onRowTap(row.index) }
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .height(IntrinsicSize.Min)
+                .padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
+        Column(modifier = Modifier.weight(1f).padding(vertical = 12.dp)) {
             Text(
                 text = row.song.title,
                 color = if (row.isCurrent) accent else Color.White,
@@ -1204,7 +1339,8 @@ private fun QueueRowItem(
             Box(
                 modifier =
                     Modifier
-                        .size(28.dp)
+                        .width(48.dp)
+                        .fillMaxHeight()
                         .clickable { onTogglePlayPause() },
                 contentAlignment = Alignment.Center,
             ) {
@@ -1242,19 +1378,25 @@ private fun PinnedNowPlayingBar(
                 .height(1.dp)
                 .background(SeparatorColor),
     )
+    val barShape = RoundedCornerShape(12.dp)
     Row(
         modifier =
             Modifier
                 .fillMaxWidth()
-                .background(QueueSheetBackground)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 4.dp)
+                .clip(barShape)
+                .background(SearchBarBrush)
+                .border(PinnedBarBorder, barShape)
+                .height(IntrinsicSize.Min)
+                .padding(start = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(
             modifier =
                 Modifier
                     .weight(1f)
-                    .clickable { onLocate() },
+                    .clickable { onLocate() }
+                    .padding(vertical = 12.dp),
         ) {
             Text(
                 text = row.song.title,
@@ -1276,7 +1418,8 @@ private fun PinnedNowPlayingBar(
         Box(
             modifier =
                 Modifier
-                    .size(28.dp)
+                    .width(48.dp)
+                    .fillMaxHeight()
                     .clickable { onTogglePlayPause() },
             contentAlignment = Alignment.Center,
         ) {

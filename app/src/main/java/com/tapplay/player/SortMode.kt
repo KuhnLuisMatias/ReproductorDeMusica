@@ -46,13 +46,12 @@ enum class SortMode {
             when (mode) {
                 ADDED -> if (descending) songs.reversed() else songs
                 ARTIST -> {
-                    val ascending =
-                        songs.sortedWith(
-                            compareBy(
-                                { it.artist.lowercase() },
-                                { it.title.lowercase() },
-                            ),
-                        )
+                    // Keys computed once per song (not per comparison); same lowercase
+                    // semantics and stable order as the previous per-comparison comparator.
+                    val artistKeys = songs.map { it.artist.lowercase() }
+                    val titleKeys = songs.map { it.title.lowercase() }
+                    val order = songs.indices.sortedWith(compareBy({ artistKeys[it] }, { titleKeys[it] }))
+                    val ascending = order.map { songs[it] }
                     if (descending) ascending.reversed() else ascending
                 }
                 DATE_MODIFIED ->

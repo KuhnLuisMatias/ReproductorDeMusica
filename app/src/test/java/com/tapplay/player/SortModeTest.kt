@@ -178,6 +178,70 @@ class SortModeTest {
         assertEquals(listOf("c", "a", "b"), ordered.map { it.title })
     }
 
+    // ---- S14: ARTIST con claves precalculadas == orden anterior (caracterización) ----
+
+    // Implementación previa (comparador con lowercase por comparación), congelada como oráculo.
+    private fun legacyArtistAscending(songs: List<Song>): List<Song> =
+        songs.sortedWith(compareBy({ it.artist.lowercase() }, { it.title.lowercase() }))
+
+    // album = índice de entrada: distingue canciones con artista y título iguales.
+    private fun mixedLibrary(): List<Song> =
+        listOf(
+            song("Zeta", "ÁLVARO"),
+            song("alfa", "Álvaro"),
+            song("10 Años", "beatles"),
+            song("2 Minutes", "Beatles"),
+            song("Help", ""),
+            song("", "Beatles"),
+            song("help", "BEATLES"),
+            song("Help", "beatles"),
+            song("Help", "beatles"),
+            song("ñandú", "Ñu"),
+            song("Zeta", "zebra"),
+            song("1", "1"),
+            song("", ""),
+            song("Éxito", "Desconocido"),
+        ).mapIndexed { index, s -> s.copy(album = "i$index") }
+
+    @Test
+    fun `artist ascending keeps exactly the legacy order with accents case numbers empties and duplicates`() {
+        val songs = mixedLibrary()
+
+        val ordered = SortMode.apply(songs, SortMode.ARTIST, descending = false)
+
+        assertEquals(legacyArtistAscending(songs).map { it.album }, ordered.map { it.album })
+    }
+
+    @Test
+    fun `artist descending is the exact reverse of the ascending list`() {
+        val songs = mixedLibrary()
+
+        val asc = SortMode.apply(songs, SortMode.ARTIST, descending = false)
+        val desc = SortMode.apply(songs, SortMode.ARTIST, descending = true)
+
+        assertEquals(asc.reversed().map { it.album }, desc.map { it.album })
+    }
+
+    @Test
+    fun `artist sort of an empty list is empty`() {
+        assertEquals(emptyList<Song>(), SortMode.apply(emptyList(), SortMode.ARTIST, descending = false))
+        assertEquals(emptyList<Song>(), SortMode.apply(emptyList(), SortMode.ARTIST, descending = true))
+    }
+
+    @Test
+    fun `artist sort is stable when artist and title are equal`() {
+        val songs =
+            listOf(
+                song("Help", "Beatles").copy(album = "first"),
+                song("help", "beatles").copy(album = "second"),
+                song("HELP", "BEATLES").copy(album = "third"),
+            )
+
+        val ordered = SortMode.apply(songs, SortMode.ARTIST, descending = false)
+
+        assertEquals(listOf("first", "second", "third"), ordered.map { it.album })
+    }
+
     @Test
     fun `from parses exact names`() {
         assertEquals(SortMode.ADDED, SortMode.from("ADDED"))

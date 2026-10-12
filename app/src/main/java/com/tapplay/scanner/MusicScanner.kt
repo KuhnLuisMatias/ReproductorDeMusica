@@ -2,6 +2,9 @@ package com.tapplay.scanner
 
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
+import android.provider.DocumentsContract
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import com.tapplay.model.Song
 import kotlinx.coroutines.Dispatchers
@@ -49,10 +52,13 @@ object MusicScanner {
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
     ): List<Song> =
         withContext(Dispatchers.IO) {
-            val tree = DocumentFile.fromTreeUri(context, treeUri) ?: return@withContext emptyList()
-            val entries = TreeFlatten.flatten(DocumentTreeFolder(tree))
+            val startMs = SystemClock.elapsedRealtime()
+            val root = listedRoot(context, treeUri) ?: return@withContext emptyList()
+            val entries = TreeFlatten.flatten(root)
+            val listedMs = SystemClock.elapsedRealtime()
             val ordered =
                 ScanOrdering.groupOrdered(entries, { it.folderPath }, { it.file.name })
+            val sortedMs = SystemClock.elapsedRealtime()
             onProgress(0, ordered.size)
             val cachedByUri =
                 cache
@@ -61,18 +67,24 @@ object MusicScanner {
                     ?.associateBy { it.uri }
                     .orEmpty()
             val done = AtomicInteger(0)
+            val cacheHits = AtomicInteger(0)
+            val extractions = AtomicInteger(0)
             val songs =
                 coroutineScope {
                     ordered.map { entry ->
                         async {
                             extractionLimiter.withPermit {
-                                val document = entry.file as DocumentTreeFolder
-                                val documentUri = document.file.uri.toString()
-                                val fileName = document.file.name.orEmpty()
+                                val document = entry.file
+                                val documentUri = document.uri
+                                val fileName = document.name
                                 val metadata =
                                     cachedByUri[documentUri]?.let {
+                                        cacheHits.incrementAndGet()
                                         SongMetadata(it.title, it.artist, it.album, it.durationMs)
-                                    } ?: MetadataExtractor.extract(context, document.file.uri, fileName)
+                                    } ?: run {
+                                        extractions.incrementAndGet()
+                                        MetadataExtractor.extract(context, Uri.parse(documentUri), fileName)
+                                    }
                 Song(
                     uri = documentUri,
                     path = documentUri,
@@ -88,6 +100,17 @@ object MusicScanner {
                     }
                 }.awaitAll()
             cache?.write(treeUri.toString(), MetadataCacheCodec.encode(songs.map { it.toCachedTrack() }))
+            val metrics =
+                ScanMetrics(
+                    files = songs.size,
+                    startMs = startMs,
+                    listedMs = listedMs,
+                    sortedMs = sortedMs,
+                    extractedMs = SystemClock.elapsedRealtime(),
+                    cacheHits = cacheHits.get(),
+                    extractions = extractions.get(),
+                )
+            Log.d("ScanMetrics", metrics.format())
             songs
         }
 
@@ -162,4 +185,40 @@ private class DocumentTreeFolder(
     override val children: List<TreeFolder> by lazy {
         file.listFiles().map { DocumentTreeFolder(it) }
     }
+}
+
+/**
+ * Root of the listed tree: every folder is read with ONE provider query and
+ * its children expose already-read name/isFile/uri. Null if the tree URI is invalid.
+ */
+private fun listedRoot(
+    context: Context,
+    treeUri: Uri,
+): TreeFolder? {
+    val rootDocId =
+        runCatching {
+            val docId =
+                if (DocumentsContract.isDocumentUri(context, treeUri)) {
+                    DocumentsContract.getDocumentId(treeUri)
+                } else {
+                    null
+                }
+            rootDocumentIdFor(DocumentsContract.getTreeDocumentId(treeUri), docId)
+        }.getOrNull() ?: return null
+    val lister = ContentResolverChildLister(context.contentResolver, treeUri)
+
+    fun folderOf(entry: ChildEntry): TreeFolder {
+        val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, entry.documentId)
+        return ListedTreeFolder(
+            entry = entry,
+            uri = uri.toString(),
+            lister = lister,
+            childFactory = { folderOf(it) },
+            fallbackChildren = {
+                DocumentFile.fromTreeUri(context, uri)?.listFiles().orEmpty().map { DocumentTreeFolder(it) }
+            },
+            isFileFallback = { DocumentFile.fromTreeUri(context, uri)?.isFile ?: false },
+        )
+    }
+    return folderOf(ChildEntry(rootDocId, "", DIRECTORY_MIME, 0L, 0L))
 }
