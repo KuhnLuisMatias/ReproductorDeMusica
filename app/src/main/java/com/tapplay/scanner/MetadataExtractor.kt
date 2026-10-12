@@ -45,9 +45,10 @@ object MetadataExtractor {
         context: Context,
         uri: Uri,
         fileName: String,
+        timing: ((setDataSourceMs: Long, tagsMs: Long) -> Unit)? = null,
     ): SongMetadata =
         try {
-            extractUnsafe(context, uri, fileName)
+            extractUnsafe(context, uri, fileName, timing)
         } catch (e: Exception) {
             SongMetadata(
                 title = MetadataFallbacks.resolveTitle(null, fileName),
@@ -61,14 +62,18 @@ object MetadataExtractor {
         context: Context,
         uri: Uri,
         fileName: String,
+        timing: ((Long, Long) -> Unit)?,
     ): SongMetadata {
         val retriever = MediaMetadataRetriever()
         return try {
+            val t0 = System.nanoTime()
             retriever.setDataSource(context, uri)
+            val t1 = System.nanoTime()
             val title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)
             val artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST)
             val album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM)
             val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            timing?.invoke((t1 - t0) / 1_000_000, (System.nanoTime() - t1) / 1_000_000)
             SongMetadata(
                 title = MetadataFallbacks.resolveTitle(title, fileName),
                 artist = MetadataFallbacks.resolveArtist(artist),

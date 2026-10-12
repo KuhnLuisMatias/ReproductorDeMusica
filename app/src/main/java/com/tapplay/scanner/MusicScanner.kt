@@ -53,12 +53,17 @@ object MusicScanner {
     ): List<Song> =
         withContext(Dispatchers.IO) {
             val startMs = SystemClock.elapsedRealtime()
-            val root = listedRoot(context, treeUri) ?: return@withContext emptyList()
+            ImportTimeline.mark("scanStart")
+            val listStats = DurationStats()
+            val root = listedRoot(context, treeUri, listStats::add) ?: return@withContext emptyList()
             val entries = TreeFlatten.flatten(root)
             val listedMs = SystemClock.elapsedRealtime()
+            val (listP50, _, listMax) = listStats.summary()
+            ImportTimeline.mark("listDone", "queries" to listStats.count(), "listP50" to listP50, "listMax" to listMax)
             val ordered =
                 ScanOrdering.groupOrdered(entries, { it.folderPath }, { it.file.name })
             val sortedMs = SystemClock.elapsedRealtime()
+            ImportTimeline.mark("sortDone", "files" to ordered.size)
             onProgress(0, ordered.size)
             val cachedByUri =
                 cache
@@ -69,37 +74,78 @@ object MusicScanner {
             val done = AtomicInteger(0)
             val cacheHits = AtomicInteger(0)
             val extractions = AtomicInteger(0)
+            val setDataSourceStats = DurationStats()
+            val tagsStats = DurationStats()
+            val waitStats = DurationStats()
+            val thirds = List(3) { DurationStats() }
+            val inFlight = AtomicInteger(0)
+            val concMax = AtomicInteger(0)
             val songs =
                 coroutineScope {
-                    ordered.map { entry ->
+                    ordered.mapIndexed { index, entry ->
                         async {
+                            val waitStartNs = System.nanoTime()
                             extractionLimiter.withPermit {
-                                val document = entry.file
-                                val documentUri = document.uri
-                                val fileName = document.name
-                                val metadata =
-                                    cachedByUri[documentUri]?.let {
-                                        cacheHits.incrementAndGet()
-                                        SongMetadata(it.title, it.artist, it.album, it.durationMs)
-                                    } ?: run {
-                                        extractions.incrementAndGet()
-                                        MetadataExtractor.extract(context, Uri.parse(documentUri), fileName)
-                                    }
-                Song(
-                    uri = documentUri,
-                    path = documentUri,
-                    title = metadata.title,
-                    artist = metadata.artist,
-                    album = metadata.album,
-                    durationMs = metadata.durationMs,
-                    lastModified = cachedByUri[documentUri]?.lastModified,
-                    addedAtMs = cachedByUri[documentUri]?.addedAtMs ?: System.currentTimeMillis(),
-                ).also { onProgress(done.incrementAndGet(), ordered.size) }
+                                waitStats.add((System.nanoTime() - waitStartNs) / 1_000_000)
+                                concMax.updateAndGet { maxOf(it, inFlight.incrementAndGet()) }
+                                val itemStartNs = System.nanoTime()
+                                try {
+                                    val document = entry.file
+                                    val documentUri = document.uri
+                                    val fileName = document.name
+                                    val metadata =
+                                        cachedByUri[documentUri]?.let {
+                                            cacheHits.incrementAndGet()
+                                            SongMetadata(it.title, it.artist, it.album, it.durationMs)
+                                        } ?: run {
+                                            extractions.incrementAndGet()
+                                            MetadataExtractor.extract(context, Uri.parse(documentUri), fileName) { dsMs, tagMs ->
+                                                setDataSourceStats.add(dsMs)
+                                                tagsStats.add(tagMs)
+                                            }
+                                        }
+                                    Song(
+                                        uri = documentUri,
+                                        path = documentUri,
+                                        title = metadata.title,
+                                        artist = metadata.artist,
+                                        album = metadata.album,
+                                        durationMs = metadata.durationMs,
+                                        lastModified = cachedByUri[documentUri]?.lastModified,
+                                        addedAtMs = cachedByUri[documentUri]?.addedAtMs ?: System.currentTimeMillis(),
+                                    ).also { onProgress(done.incrementAndGet(), ordered.size) }
+                                } finally {
+                                    inFlight.decrementAndGet()
+                                    thirds[index * 3 / ordered.size].add((System.nanoTime() - itemStartNs) / 1_000_000)
+                                }
                             }
                         }
                     }
                 }.awaitAll()
+            val extractedMs = SystemClock.elapsedRealtime()
+            val (dsP50, dsP95, dsMax) = setDataSourceStats.summary()
+            val (tagP50, tagP95, tagMax) = tagsStats.summary()
+            val (waitP50, waitP95, _) = waitStats.summary()
+            ImportTimeline.mark(
+                "extractDone",
+                "files" to songs.size,
+                "hits" to cacheHits.get(),
+                "extractions" to extractions.get(),
+                "conc_max" to concMax.get(),
+                "dsP50" to dsP50,
+                "dsP95" to dsP95,
+                "dsMax" to dsMax,
+                "tagsP50" to tagP50,
+                "tagsP95" to tagP95,
+                "tagsMax" to tagMax,
+                "waitP50" to waitP50,
+                "waitP95" to waitP95,
+                "third1P50" to thirds[0].summary().first,
+                "third2P50" to thirds[1].summary().first,
+                "third3P50" to thirds[2].summary().first,
+            )
             cache?.write(treeUri.toString(), MetadataCacheCodec.encode(songs.map { it.toCachedTrack() }))
+            ImportTimeline.mark("cacheWritten", "ms" to SystemClock.elapsedRealtime() - extractedMs)
             val metrics =
                 ScanMetrics(
                     files = songs.size,
@@ -194,6 +240,7 @@ private class DocumentTreeFolder(
 private fun listedRoot(
     context: Context,
     treeUri: Uri,
+    onQueryMs: ((Long) -> Unit)? = null,
 ): TreeFolder? {
     val rootDocId =
         runCatching {
@@ -205,7 +252,7 @@ private fun listedRoot(
                 }
             rootDocumentIdFor(DocumentsContract.getTreeDocumentId(treeUri), docId)
         }.getOrNull() ?: return null
-    val lister = ContentResolverChildLister(context.contentResolver, treeUri)
+    val lister = ContentResolverChildLister(context.contentResolver, treeUri, onQueryMs)
 
     fun folderOf(entry: ChildEntry): TreeFolder {
         val uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, entry.documentId)

@@ -83,8 +83,18 @@ internal class ListedTreeFolder(
 internal class ContentResolverChildLister(
     private val resolver: ContentResolver,
     private val treeUri: Uri,
+    private val onQueryMs: ((Long) -> Unit)? = null,
 ) : ChildLister {
     override fun list(parentDocId: String): List<ChildEntry> {
+        val startNs = System.nanoTime()
+        try {
+            return listUnmeasured(parentDocId)
+        } finally {
+            onQueryMs?.invoke((System.nanoTime() - startNs) / 1_000_000)
+        }
+    }
+
+    private fun listUnmeasured(parentDocId: String): List<ChildEntry> {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
         val cursor =
             resolver.query(childrenUri, PROJECTION, null, null, null)

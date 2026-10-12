@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,6 +20,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
+import com.tapplay.scanner.ImportTimeline
 
 /**
  * Folder flow controller (spec: folder-selection, design D1): audio permission
@@ -45,8 +47,11 @@ fun rememberFolderPickerFlow(onFolderPicked: (Uri) -> Unit): FolderPickerFlow {
     val treePickerLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
             if (uri != null) {
+                ImportTimeline.begin()
+                val permissionStartMs = SystemClock.elapsedRealtime()
                 context.contentResolver
                     .takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                ImportTimeline.mark("permissionTaken", "dur" to SystemClock.elapsedRealtime() - permissionStartMs)
                 onFolderPicked(uri)
             }
         }

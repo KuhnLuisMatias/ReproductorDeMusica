@@ -14,6 +14,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.tapplay.model.Song
+import com.tapplay.scanner.ImportTimeline
 import com.tapplay.scanner.MetadataCacheCodec
 import com.tapplay.scanner.MetadataCacheStore
 import com.tapplay.scanner.MusicScanner
@@ -90,6 +91,7 @@ class PlaybackManager(
                 updateState()
                 updateTicker(isPlaying)
                 if (isPlaying) {
+                    ImportTimeline.onPlaying()
                     schedulePeriodicPositionPersist()
                 } else {
                     cancelPositionPersist()
@@ -144,12 +146,22 @@ class PlaybackManager(
         activeQuery = "" // folder pick resets the filter scope (R11)
         fullQueue = null
         val mediaController = controller ?: return
+        val sortStartMs = SystemClock.elapsedRealtime()
         val sorted = SortMode.apply(songs, SortMode.from(prefs.queueSortMode), prefs.queueSortDescending)
-        mediaController.setMediaItems(queueManager.buildMediaItems(sorted))
+        val sortedMs = SystemClock.elapsedRealtime()
+        val items = queueManager.buildMediaItems(sorted)
+        ImportTimeline.mark("buildItemsDone", "sortMs" to sortedMs - sortStartMs, "buildMs" to SystemClock.elapsedRealtime() - sortedMs)
+        val setStartMs = SystemClock.elapsedRealtime()
+        mediaController.setMediaItems(items)
+        ImportTimeline.mark("setItemsDone", "ms" to SystemClock.elapsedRealtime() - setStartMs)
+        val snapshotStartMs = SystemClock.elapsedRealtime()
         persistQueueSnapshot(sorted)
+        ImportTimeline.mark("snapshotPersisted", "ms" to SystemClock.elapsedRealtime() - snapshotStartMs)
         mediaController.repeatMode = Player.REPEAT_MODE_OFF
         mediaController.prepare()
+        ImportTimeline.mark("prepareCalled")
         updateState()
+        ImportTimeline.mark("queuePublished")
     }
 
     fun play() {
@@ -575,10 +587,12 @@ class PlaybackManager(
             }
             val songs =
                 MusicScanner.scan(context, treeUri, metadataCache) { done, total ->
+                    ImportTimeline.countProgress()
                     _uiState.update {
                         it.copy(scanPhase = ScanPhase.EXTRACTING, scanLoaded = done, scanTotal = total)
                     }
                 }
+            ImportTimeline.mark("scanReturned", "files" to songs.size)
             _uiState.update { it.copy(scanPhase = ScanPhase.IDLE) }
             songs
         } catch (e: CancellationException) {

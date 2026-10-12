@@ -417,6 +417,30 @@ class QueueSheetModelTest {
         assertNull(anchorIndex(rows, null))
     }
 
+    // ---- reopenScrollIndex: scroll restore on sheet reopen (S15) ----
+
+    @Test
+    fun `reopenScrollIndex leaves the position alone while a filter is active`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 0)
+
+        assertNull(reopenScrollIndex(rows, "beatles", "content://tree/b"))
+    }
+
+    @Test
+    fun `reopenScrollIndex restores the anchor index without a filter`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 0)
+
+        assertEquals(1, reopenScrollIndex(rows, "", "content://tree/b"))
+    }
+
+    @Test
+    fun `reopenScrollIndex opens at 0 without a filter when the anchor is missing or null`() {
+        val rows = queueRows(listOf(song("a", 0L), song("b", 0L)), currentIndex = 0)
+
+        assertEquals(0, reopenScrollIndex(rows, "   ", "content://tree/unknown"))
+        assertEquals(0, reopenScrollIndex(rows, "", null))
+    }
+
     // ---- S12: scroll save/restore around the artist filter ----
 
     @Test
@@ -634,17 +658,17 @@ class QueueSheetModelTest {
 
     @Test
     fun `searchImeOutcome hides the keyboard with an empty query`() {
-        assertEquals(SearchImeOutcome.HIDE_KEYBOARD, searchImeOutcome(""))
+        assertEquals(SearchImeOutcome.HIDE_ONLY, searchImeOutcome(""))
     }
 
     @Test
     fun `searchImeOutcome hides the keyboard with a whitespace-only query`() {
-        assertEquals(SearchImeOutcome.HIDE_KEYBOARD, searchImeOutcome("   "))
+        assertEquals(SearchImeOutcome.HIDE_ONLY, searchImeOutcome("   "))
     }
 
     @Test
     fun `searchImeOutcome commits the search when there is text`() {
-        assertEquals(SearchImeOutcome.COMMIT, searchImeOutcome("beatles"))
+        assertEquals(SearchImeOutcome.COMMIT_AND_HIDE, searchImeOutcome("beatles"))
     }
 
     // ---- swipeFadeAlpha / swipeRedAlpha: queue row swipe feedback (S11) ----

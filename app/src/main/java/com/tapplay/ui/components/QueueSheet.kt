@@ -223,11 +223,11 @@ fun searchTrailingAction(
     }
 
 /** What the IME Search action does (S9). */
-enum class SearchImeOutcome { COMMIT, HIDE_KEYBOARD }
+enum class SearchImeOutcome { COMMIT_AND_HIDE, HIDE_ONLY }
 
 /** Pure seam (JVM-tested): text -> commit the search; blank/empty -> just hide the keyboard. */
 fun searchImeOutcome(query: String): SearchImeOutcome {
-    return if (query.isNotBlank()) SearchImeOutcome.COMMIT else SearchImeOutcome.HIDE_KEYBOARD
+    return if (query.isNotBlank()) SearchImeOutcome.COMMIT_AND_HIDE else SearchImeOutcome.HIDE_ONLY
 }
 
 /** Swipe-to-remove feedback (S11): content fades to this alpha and the red background is full at [SWIPE_FADE_END_PROGRESS]. */
@@ -379,6 +379,17 @@ fun anchorIndex(
     val index = rows.indexOfFirst { it.song.uri == uri }
     return index.takeIf { it >= 0 }
 }
+
+/**
+ * Index to scroll to when the sheet reopens (S15). Null = leave the position alone: with a
+ * filter active, [androidx.compose.foundation.lazy.LazyListState] already holds it and the
+ * persisted anchor belongs to the unfiltered list.
+ */
+fun reopenScrollIndex(
+    visibleRows: List<QueueRow>,
+    query: String,
+    anchorUri: String?,
+): Int? = if (query.isNotBlank()) null else (anchorIndex(visibleRows, anchorUri) ?: 0)
 
 /** Scroll position captured when entering the filter (S12): first visible row's uri, index and pixel offset. */
 data class SavedScroll(
@@ -590,7 +601,9 @@ fun QueueSheetContent(
             anchorRestored = false
             return@LaunchedEffect
         }
-        listState.scrollToItem(anchorIndex(visibleRows, scrollAnchorUri) ?: 0)
+        val target = reopenScrollIndex(visibleRows, query, scrollAnchorUri)
+        Log.d("QueueSheet", if (target == null) "reopen scroll skipped (filter active)" else "reopen scroll index=$target")
+        target?.let { listState.scrollToItem(it) }
         anchorRestored = true
     }
 
@@ -762,11 +775,9 @@ fun QueueSheetContent(
                     KeyboardActions(onSearch = {
                         val outcome = searchImeOutcome(query)
                         Log.d("QueueSearch", "ime search outcome=$outcome")
-                        when (outcome) {
-                            SearchImeOutcome.COMMIT -> onCommitSearch(query)
-                            // Hide only; focus stays so the trailing control does not flip.
-                            SearchImeOutcome.HIDE_KEYBOARD -> keyboardController?.hide()
-                        }
+                        if (outcome == SearchImeOutcome.COMMIT_AND_HIDE) onCommitSearch(query)
+                        // Always hide; focus stays so the trailing control does not flip.
+                        keyboardController?.hide()
                     }),
                 modifier =
                     Modifier

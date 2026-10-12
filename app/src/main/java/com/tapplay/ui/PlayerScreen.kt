@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -36,6 +37,7 @@ import androidx.compose.material.Text
 import androidx.compose.material.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,6 +62,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tapplay.TapPlayApplication
 import com.tapplay.player.PlaybackManager
 import com.tapplay.player.ScanPhase
+import com.tapplay.scanner.ImportTimeline
 import com.tapplay.ui.components.PlayPauseTransientOverlay
 import com.tapplay.ui.components.QueueChevronCenterFromBottom
 import com.tapplay.ui.components.QueueSheetBackground
@@ -268,6 +271,7 @@ fun PlayerScreen() {
 
             // Scanning progress indicator (only when scanning library)
             if (state.isScanning) {
+                SideEffect { ImportTimeline.countRecomposition() }
                 Column(
                     modifier =
                         Modifier
@@ -367,11 +371,20 @@ private fun handleFolderPicked(
 ) {
     val prefs = (context.applicationContext as TapPlayApplication).prefs
     prefs.lastFolderUri = uri.toString()
+    ImportTimeline.setKind(uri.authority, runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull())
+    ImportTimeline.startHeartbeat(scope)
     scope.launch {
-        val songs = playbackManager.scanLibrary(uri)
-        if (songs.isNotEmpty()) {
-            playbackManager.setQueue(songs)
-            playbackManager.play()
+        try {
+            val songs = playbackManager.scanLibrary(uri)
+            if (songs.isNotEmpty()) {
+                playbackManager.setQueue(songs)
+                playbackManager.play()
+            } else {
+                ImportTimeline.end()
+            }
+        } catch (e: Throwable) {
+            ImportTimeline.end()
+            throw e
         }
     }
 }
